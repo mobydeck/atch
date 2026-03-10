@@ -224,7 +224,12 @@ static int log_already_replayed;
 ** killed/crashed (socket still on disk), ENOENT means clean exit (socket was
 ** unlinked; end marker is already in the log).
 ** Pass 0 when replaying for a running session (no end message printed).
-** Returns 1 if a log was found and replayed, 0 if no log exists. */
+** Returns 1 if a log was found and replayed, 0 if no log exists.
+**
+** Only the last SCROLLBACK_SIZE bytes of the log are replayed to avoid
+** overwhelming the terminal when attaching to a session with a large log
+** (e.g. a long-running build).  This matches the in-memory ring-buffer cap
+** used when replaying a live session's scrollback. */
 int replay_session_log(int saved_errno)
 {
 	char log_path[600];
@@ -239,6 +244,18 @@ int replay_session_log(int saved_errno)
 	{
 		unsigned char rbuf[BUFSIZE];
 		ssize_t n;
+		off_t log_size;
+
+		/* Seek to the last SCROLLBACK_SIZE bytes so that a very large
+		 * log (e.g. from a long build session) does not flood the
+		 * terminal.  If the log is smaller than SCROLLBACK_SIZE, start
+		 * from the beginning. */
+		log_size = lseek(logfd, 0, SEEK_END);
+		if (log_size > (off_t)SCROLLBACK_SIZE)
+			lseek(logfd, log_size - (off_t)SCROLLBACK_SIZE,
+			      SEEK_SET);
+		else
+			lseek(logfd, 0, SEEK_SET);
 
 		while ((n = read(logfd, rbuf, sizeof(rbuf))) > 0)
 			write(1, rbuf, (size_t)n);

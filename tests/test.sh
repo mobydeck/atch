@@ -628,7 +628,83 @@ run "$ATCH" start -C foo C-bad sleep 999
 assert_exit     "-C invalid: exit 1"                 1 "$rc"
 assert_contains "-C invalid: message"                "Invalid log size" "$out"
 
-# ── 21. no-args → usage ──────────────────────────────────────────────────────
+# ── 21. replay_session_log: bounded replay (last SCROLLBACK_SIZE bytes only) ──
+#
+# Regression test for: replay_session_log must replay at most SCROLLBACK_SIZE
+# (128 KB) of the session log.  Without this cap, attaching a session with a
+# large log (e.g. a long-running build) causes an overwhelming scroll that
+# appears to loop indefinitely.
+#
+# Strategy: create a synthetic .log file larger than SCROLLBACK_SIZE (128 KB),
+# attach to the dead session using expect(1) to supply a PTY (required by
+# attach_main), and verify the output byte count and content.
+#
+# expect(1) is available on macOS by default and on most Linux distros.
+# If absent, the test is skipped.
+
+if command -v expect >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    mkdir -p "$HOME/.cache/atch"
+
+    REPLAY_SOCK="$HOME/.cache/atch/replay-cap-sess"
+    REPLAY_LOG="${REPLAY_SOCK}.log"
+
+    # Build a log of ~290 KB: OLD_DATA fills the first 160 KB,
+    # NEW_DATA fills the last 128 KB.  Only NEW_DATA should appear in replay.
+    python3 -c "
+import sys
+old = b'OLD_DATA_LINE_PADDED_TO_EXACTLY_32B\n'
+new = b'NEW_DATA_LINE_PADDED_TO_EXACTLY_32B\n'
+old_count = (160 * 1024) // len(old) + 1
+new_count = (128 * 1024) // len(new) + 1
+sys.stdout.buffer.write(old * old_count)
+sys.stdout.buffer.write(new * new_count)
+" > "$REPLAY_LOG"
+
+    # Use expect to run atch attach with a real PTY, capturing all output.
+    # atch exits immediately after replaying the log for a dead session.
+    REPLAY_OUT=$(mktemp)
+    expect - << EXPECT_EOF > "$REPLAY_OUT" 2>/dev/null
+set timeout 10
+spawn $ATCH attach replay-cap-sess
+expect eof
+EXPECT_EOF
+
+    OUT_BYTES=$(wc -c < "$REPLAY_OUT")
+
+    # Output must stay within SCROLLBACK_SIZE + some terminal-overhead margin
+    # (expect may inject a few extra bytes; 256 KB is a safe upper bound).
+    MAX_BYTES=262144
+    if [ "$OUT_BYTES" -le "$MAX_BYTES" ]; then
+        ok "replay-log: output bounded ($OUT_BYTES <= $MAX_BYTES bytes)"
+    else
+        fail "replay-log: output bounded" \
+             "<= $MAX_BYTES bytes" "$OUT_BYTES bytes"
+    fi
+
+    # Replayed content must come from the tail (NEW_DATA present).
+    if grep -q "NEW_DATA" "$REPLAY_OUT" 2>/dev/null; then
+        ok "replay-log: tail of log replayed (NEW_DATA present)"
+    else
+        fail "replay-log: tail of log replayed (NEW_DATA present)" \
+             "NEW_DATA in output" "not found"
+    fi
+
+    # HEAD of log must NOT appear (OLD_DATA absent).
+    if grep -q "OLD_DATA" "$REPLAY_OUT" 2>/dev/null; then
+        fail "replay-log: head of log skipped (OLD_DATA absent)" \
+             "no OLD_DATA" "OLD_DATA found"
+    else
+        ok "replay-log: head of log skipped (OLD_DATA absent)"
+    fi
+
+    rm -f "$REPLAY_OUT" "$REPLAY_LOG"
+else
+    ok "replay-log: skip (expect or python3 not available)"
+    ok "replay-log: skip (expect or python3 not available)"
+    ok "replay-log: skip (expect or python3 not available)"
+fi
+
+# ── 22. no-args → usage ──────────────────────────────────────────────────────
 
 # Invoking with zero arguments calls usage() (exits 0, prints help).
 # We already consumed the binary name in main, so argc < 1 → usage().
