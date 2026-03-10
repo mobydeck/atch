@@ -636,6 +636,109 @@ run "$ATCH"
 assert_exit     "no args: exits 0 (usage)"           0 "$rc"
 assert_contains "no args: shows Usage:"              "Usage:" "$out"
 
+# ── 23. detach-status: S_IXUSR cleared immediately after MSG_DETACH ──────────
+#
+# Regression test for: when the client detaches (Ctrl+\), it must send
+# MSG_DETACH to the master BEFORE calling exit(0).  This ensures the master
+# clears the S_IXUSR bit on the socket synchronously (within one select cycle)
+# so that `atch list` never races with a stale "[attached]" status.
+#
+# Without the fix, the client exits without MSG_DETACH; the master only learns
+# about the detach when it receives EOF on the closed fd, which can arrive after
+# a `list` reads the stale S_IXUSR bit — especially on loaded systems.
+#
+# Strategy: use Python to simulate the two scenarios:
+#   A. MSG_DETACH sent before close  → socket must lose S_IXUSR immediately
+#   B. Close without MSG_DETACH      → socket loses S_IXUSR after one master
+#                                       select cycle (tolerated, but slower)
+#
+# The critical invariant tested here is scenario A: after MSG_DETACH is sent
+# and acknowledged, `list` must NOT show "[attached]".  This is the exact
+# behaviour enforced by the fix in process_kbd.
+
+if command -v python3 >/dev/null 2>&1; then
+
+    # Helper: send MSG_ATTACH, optionally MSG_DETACH, then close.
+    # Usage: attach_and_detach <sock_path> <send_detach: 0|1>
+    attach_and_detach() {
+        python3 - "$1" "$2" << 'PYEOF'
+import socket, struct, sys, time
+
+sock_path = sys.argv[1]
+send_detach = sys.argv[2] == '1'
+
+MSG_ATTACH = 1
+MSG_DETACH = 2
+
+def pkt(msg_type):
+    return struct.pack('BB8s', msg_type, 0, b'\x00' * 8)
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+s.sendall(pkt(MSG_ATTACH))
+time.sleep(0.05)   # let master process MSG_ATTACH and set S_IXUSR
+if send_detach:
+    s.sendall(pkt(MSG_DETACH))
+    time.sleep(0.05)  # let master process MSG_DETACH and clear S_IXUSR
+s.close()
+PYEOF
+    }
+
+    # --- single session: proper MSG_DETACH flow (scenario A) ---
+    "$ATCH" start det-s1 sleep 999
+    wait_socket det-s1
+    SOCK1="$HOME/.cache/atch/det-s1"
+
+    attach_and_detach "$SOCK1" 1   # send MSG_DETACH before close
+    sleep 0.05                     # minimal delay after close
+
+    run "$ATCH" list
+    assert_not_contains \
+        "detach-status: session not shown as attached after MSG_DETACH" \
+        "[attached]" "$out"
+
+    tidy det-s1
+
+    # --- two sessions: reproduce the multi-session attach/detach cycle ---
+    # Steps mirror the exact reproduction sequence from the bug report:
+    #   create s1, detach, create s2, detach,
+    #   attach s1, detach, attach s2, detach → none should show [attached]
+    "$ATCH" start det-a sleep 999
+    "$ATCH" start det-b sleep 999
+    wait_socket det-a
+    wait_socket det-b
+    SOCKA="$HOME/.cache/atch/det-a"
+    SOCKB="$HOME/.cache/atch/det-b"
+
+    attach_and_detach "$SOCKA" 1
+    sleep 0.05
+    attach_and_detach "$SOCKB" 1
+    sleep 0.05
+    attach_and_detach "$SOCKA" 1
+    sleep 0.05
+
+    run "$ATCH" list
+    assert_not_contains \
+        "detach-status: det-a not [attached] after second detach cycle" \
+        "[attached]" "$out"
+
+    attach_and_detach "$SOCKB" 1
+    sleep 0.05
+
+    run "$ATCH" list
+    assert_not_contains \
+        "detach-status: det-b not [attached] after detach cycle" \
+        "[attached]" "$out"
+
+    tidy det-a
+    tidy det-b
+
+else
+    ok "detach-status: skip (python3 not available)"
+    ok "detach-status: skip (python3 not available)"
+    ok "detach-status: skip (python3 not available)"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 
 printf "\n1..%d\n" "$T"

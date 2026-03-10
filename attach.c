@@ -203,6 +203,13 @@ static void process_kbd(int s, struct packet *pkt)
 	else if (pkt->u.buf[0] == detach_char) {
 		char age[32];
 		session_age(age, sizeof(age));
+		/* Tell the master we are detaching so it clears S_IXUSR on
+		 * the socket immediately, before this process exits.
+		 * Without this, the master only learns about the detach when
+		 * it receives EOF on close(), which can race with a concurrent
+		 * `atch list` reading the stale S_IXUSR bit. */
+		pkt->type = MSG_DETACH;
+		write_packet_or_fail(s, pkt);
 		printf("%s[%s: session '%s' detached after %s]\r\n",
 		       clear_csi_data(), progname, session_shortname(), age);
 		exit(0);
