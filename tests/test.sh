@@ -628,6 +628,71 @@ run "$ATCH" start -C foo C-bad sleep 999
 assert_exit     "-C invalid: exit 1"                 1 "$rc"
 assert_contains "-C invalid: message"                "Invalid log size" "$out"
 
+# ── 21. ATCH_SESSION ancestry protection ─────────────────────────────────────
+#
+# Regression test for the ATCH_SESSION stale-ancestry bug.
+#
+# The anti-recursion guard in attach_main must only fire when the current
+# process is genuinely a descendant of the target session.  It must NOT fire
+# when ATCH_SESSION merely contains the session path but the process is not
+# actually running inside that session (stale env var).
+#
+# Because attach_main is only reached after require_tty() in the normal
+# command path, we probe the guard by simulating the session's .ppid file:
+#
+#   • No .ppid file (or PID 0) → guard is bypassed → "does not exist" / "requires a terminal"
+#   • .ppid file with a PID that IS an ancestor of the current shell → guard fires
+#   • .ppid file with a PID that is NOT an ancestor (e.g. already-dead PID) → guard bypassed
+#
+# A session's .ppid file is written by the master and contains the PID of the
+# shell process running inside the pty (the_pty.pid).
+
+mkdir -p "$HOME/.cache/atch"
+
+# Case A: ATCH_SESSION holds a session path, NO .ppid file exists → no block
+GHOST_SOCK="$HOME/.cache/atch/ghost-session"
+# No socket, no .ppid — completely absent session
+run env ATCH_SESSION="$GHOST_SOCK" "$ATCH" attach ghost-session 2>&1
+assert_exit "ppid-guard: no ppid file → exit 1 (not self-attach)"  1 "$rc"
+assert_not_contains "ppid-guard: no ppid file → no self-attach msg" \
+    "from within itself" "$out"
+
+# Case B: .ppid file contains a dead / non-ancestor PID → guard must NOT fire
+"$ATCH" start ppid-live sleep 9999
+wait_socket ppid-live
+PPID_SOCK="$HOME/.cache/atch/ppid-live"
+# Write a PID that is definitely not an ancestor (PID 1 is init/launchd,
+# which is NOT a direct ancestor of our test shell in a normal session).
+# Using a large unlikely-to-exist PID is fragile; using PID 1 is safe because
+# PID 1 is the root, not our direct ancestor in the process hierarchy
+# (our shell's ppid is the test runner, not init).
+# Actually we need a PID that is NOT in our ancestry. PID of a sleep process works.
+DEAD_PID_PROC=$(sh -c 'sleep 60 & echo $!')
+sleep 0.05
+kill "$DEAD_PID_PROC" 2>/dev/null
+wait "$DEAD_PID_PROC" 2>/dev/null
+# DEAD_PID_PROC is now dead — write it as ppid
+printf "%d\n" "$DEAD_PID_PROC" > "${PPID_SOCK}.ppid"
+run env ATCH_SESSION="$PPID_SOCK" "$ATCH" attach ppid-live 2>&1
+assert_exit "ppid-guard: dead ppid → exit 1 (not self-attach)" 1 "$rc"
+assert_not_contains "ppid-guard: dead ppid → no self-attach msg" \
+    "from within itself" "$out"
+tidy ppid-live
+
+# Case C: .ppid file contains the PID of our current shell → guard MUST fire
+"$ATCH" start self-session sleep 9999
+wait_socket self-session
+SELF_SOCK="$HOME/.cache/atch/self-session"
+# Write the PID of the current shell ($$) as if this process IS the shell
+# running inside the session.  From atch's perspective, our process IS a
+# descendant of "$$" (itself) — so the guard should trigger.
+printf "%d\n" "$$" > "${SELF_SOCK}.ppid"
+run env ATCH_SESSION="$SELF_SOCK" "$ATCH" attach self-session 2>&1
+assert_exit "ppid-guard: self as ppid → blocked exit 1" 1 "$rc"
+assert_contains "ppid-guard: self as ppid → self-attach msg" \
+    "from within itself" "$out"
+tidy self-session
+
 # ── 21. no-args → usage ──────────────────────────────────────────────────────
 
 # Invoking with zero arguments calls usage() (exits 0, prints help).

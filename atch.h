@@ -132,6 +132,7 @@ void get_session_dir(char *buf, size_t size);
 int socket_with_chdir(char *path, int (*fn)(char *));
 
 int replay_session_log(int saved_errno);
+int check_attach_ancestry(void);
 int attach_main(int noerror);
 int master_main(char **argv, int waitattach, int dontfork);
 int push_main(void);

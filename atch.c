@@ -400,6 +400,9 @@ static int cmd_attach(int argc, char **argv)
 		printf("Try '%s --help' for more information.\n", progname);
 		return 1;
 	}
+	/* Check ancestry before TTY so the correct error is shown first. */
+	if (check_attach_ancestry())
+		return 1;
 	save_term();
 	if (require_tty())
 		return 1;
@@ -714,6 +717,11 @@ int main(int argc, char **argv)
 			return 1;
 		if (mode != 'a')
 			argv = use_shell_if_no_cmd(argc, argv);
+		/* Check ancestry before TTY so the correct error fires first. */
+		if (mode == 'a' || mode == 'A' || mode == 'c') {
+			if (check_attach_ancestry())
+				return 1;
+		}
 		save_term();
 		if (dont_have_tty && mode != 'n' && mode != 'N') {
 			printf("%s: attaching to a session requires a "

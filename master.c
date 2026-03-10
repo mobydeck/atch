@@ -92,9 +92,28 @@ static int open_log(const char *path)
 	return fd;
 }
 
+/* Write the pty-child PID to <sockname>.ppid for ancestry verification. */
+static void write_session_ppid(pid_t pid)
+{
+	char ppid_path[600];
+	int fd;
+	char buf[32];
+	int len;
+
+	snprintf(ppid_path, sizeof(ppid_path), "%s.ppid", sockname);
+	fd = open(ppid_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return;
+	len = snprintf(buf, sizeof(buf), "%d\n", (int)pid);
+	write(fd, buf, (size_t)len);
+	close(fd);
+}
+
 /* Write end marker to log, close it, and unlink the socket. */
 static void cleanup_session(void)
 {
+	char ppid_path[600];
+
 	if (log_fd >= 0) {
 		time_t age = time(NULL) - master_start_time;
 		char agebuf[32];
@@ -109,6 +128,8 @@ static void cleanup_session(void)
 		log_fd = -1;
 	}
 	unlink(sockname);
+	snprintf(ppid_path, sizeof(ppid_path), "%s.ppid", sockname);
+	unlink(ppid_path);
 }
 
 /* Signal */
@@ -605,6 +626,12 @@ static void master_process(int s, char **argv, int waitattach, int statusfd)
 			printf("%s: init_pty: %s\n", progname, strerror(errno));
 		exit(1);
 	}
+
+	/* Record the pty-child PID for ancestry verification in attach_main.
+	 * attach_main reads <sockname>.ppid to confirm that a process trying
+	 * to attach is genuinely running inside this session before blocking
+	 * a re-attach based on a potentially stale ATCH_SESSION value. */
+	write_session_ppid(the_pty.pid);
 
 	/* Set up some signals. */
 	signal(SIGPIPE, SIG_IGN);

@@ -8,6 +8,104 @@
 #endif
 #endif
 
+/* ── ancestry helpers ────────────────────────────────────────────────────── */
+
+/*
+** Return the parent PID of 'pid'.
+** Returns 0 on failure (pid not found or permission denied).
+** Portable across Linux (/proc) and macOS (libproc / sysctl).
+*/
+#ifdef __APPLE__
+#include <libproc.h>
+static pid_t get_parent_pid(pid_t pid)
+{
+	struct proc_bsdinfo info;
+
+	if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0,
+			 &info, sizeof(info)) <= 0)
+		return 0;
+	return (pid_t)info.pbi_ppid;
+}
+#else
+static pid_t get_parent_pid(pid_t pid)
+{
+	char path[64];
+	FILE *f;
+	pid_t ppid = 0;
+	char line[256];
+
+	snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+	f = fopen(path, "r");
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "PPid: %d", &ppid) == 1)
+			break;
+	}
+	fclose(f);
+	return ppid;
+}
+#endif
+
+/*
+** Return 1 if 'ancestor_pid' is equal to, or an ancestor of, 'child_pid'.
+** Walks the process tree upward; gives up after 1024 steps to avoid loops.
+*/
+static int is_ancestor(pid_t ancestor_pid, pid_t child_pid)
+{
+	pid_t p = child_pid;
+	int steps = 0;
+
+	while (p > 1 && steps < 1024) {
+		if (p == ancestor_pid)
+			return 1;
+		p = get_parent_pid(p);
+		steps++;
+	}
+	/* Also check the final value (handles the p == ancestor_pid == 1 edge) */
+	return (p == ancestor_pid);
+}
+
+/*
+** Read the session shell PID from '<sockpath>.ppid'.
+** Returns 0 if the file does not exist or cannot be read.
+*/
+static pid_t read_session_ppid(const char *sockpath)
+{
+	char ppid_path[600];
+	FILE *f;
+	long pid = 0;
+
+	snprintf(ppid_path, sizeof(ppid_path), "%s.ppid", sockpath);
+	f = fopen(ppid_path, "r");
+	if (!f)
+		return 0;
+	if (fscanf(f, "%ld", &pid) != 1)
+		pid = 0;
+	fclose(f);
+	return (pid > 0) ? (pid_t)pid : 0;
+}
+
+/*
+** Return 1 if the current process is genuinely running inside the session
+** whose socket path is 'sockpath'.
+**
+** The check reads '<sockpath>.ppid' (written by the master when it forks
+** the pty child) and tests whether that PID is an ancestor of the calling
+** process.  If the file is absent or the PID is no longer an ancestor,
+** the ATCH_SESSION variable is considered stale and the guard is skipped.
+*/
+static int session_is_ancestor(const char *sockpath)
+{
+	pid_t shell_pid = read_session_ppid(sockpath);
+
+	if (shell_pid <= 0)
+		return 0;	/* no .ppid file → assume stale */
+	return is_ancestor(shell_pid, getpid());
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+
 /*
 ** The current terminal settings. After coming back from a suspend, we
 ** restore this.
@@ -256,6 +354,57 @@ int replay_session_log(int saved_errno)
 	return 1;
 }
 
+/*
+** Check whether attaching to 'sockname' would be a self-attach (i.e. the
+** current process is running inside that session's ancestry chain).
+**
+** Returns 1 and prints an error if a genuine self-attach is detected.
+** Returns 0 if the attach may proceed.
+**
+** Called before require_tty() so that the correct diagnostic is shown even
+** when there is no terminal available.
+*/
+int check_attach_ancestry(void)
+{
+	const char *tosearch = getenv(SESSION_ENVVAR);
+
+	if (!tosearch || !*tosearch)
+		return 0;
+
+	{
+		size_t slen = strlen(sockname);
+		const char *p = tosearch;
+
+		while (*p) {
+			const char *colon = strchr(p, ':');
+			size_t tlen =
+			    colon ? (size_t)(colon - p) : strlen(p);
+
+			if (tlen == slen
+			    && strncmp(p, sockname, tlen) == 0) {
+				/* Verify we are genuinely inside this
+				 * session before blocking the attach.
+				 * session_is_ancestor() reads the .ppid
+				 * file written by the master and checks
+				 * the process ancestry; if the file is
+				 * absent or the PID is not an ancestor,
+				 * ATCH_SESSION is stale → allow attach. */
+				if (session_is_ancestor(sockname)) {
+					printf
+					    ("%s: cannot attach to session '%s' from within itself\n",
+					     progname, session_shortname());
+					return 1;
+				}
+				/* Stale ATCH_SESSION — fall through. */
+			}
+			if (!colon)
+				break;
+			p = colon + 1;
+		}
+	}
+	return 0;
+}
+
 int attach_main(int noerror)
 {
 	struct packet pkt;
@@ -266,34 +415,13 @@ int attach_main(int noerror)
 	/* Refuse to attach to any session in our ancestry chain (catches both
 	 * direct self-attach and indirect loops like A -> B -> A).
 	 * SESSION_ENVVAR is the colon-separated chain, so scanning it covers
-	 * all ancestors. */
-	{
-		const char *tosearch = getenv(SESSION_ENVVAR);
-
-		if (tosearch && *tosearch) {
-			size_t slen = strlen(sockname);
-			const char *p = tosearch;
-
-			while (*p) {
-				const char *colon = strchr(p, ':');
-				size_t tlen =
-				    colon ? (size_t)(colon - p) : strlen(p);
-
-				if (tlen == slen
-				    && strncmp(p, sockname, tlen) == 0) {
-					if (!noerror)
-						printf
-						    ("%s: cannot attach to session '%s' from within itself\n",
-						     progname,
-						     session_shortname());
-					return 1;
-				}
-				if (!colon)
-					break;
-				p = colon + 1;
-			}
-		}
-	}
+	 * all ancestors.
+	 *
+	 * The check is performed via check_attach_ancestry(), which is also
+	 * called early in the command handlers (before require_tty) so the
+	 * correct error is shown even without a terminal. */
+	if (check_attach_ancestry())
+		return 1;
 
 	/* Attempt to open the socket. Don't display an error if noerror is
 	 ** set. */
