@@ -636,6 +636,84 @@ run "$ATCH"
 assert_exit     "no args: exits 0 (usage)"           0 "$rc"
 assert_contains "no args: shows Usage:"              "Usage:" "$out"
 
+# ── 22. start-inside-session: no [attached] when started from inside a session ──
+#
+# Regression test for: a session created with `atch start` from within an
+# attached session must never appear as [attached] in `atch list`.
+#
+# Root cause: create_socket restored the original umask BEFORE calling bind(2).
+# With a typical shell umask of 022, bind created the socket file with mode
+# 0755 (S_IXUSR set).  chmod(0600) was called immediately after, but the
+# tiny window between bind and chmod was enough for a concurrent `atch list`
+# (or an immediate stat after start) to see the stale execute bit and report
+# the session as [attached].
+#
+# Fix: use umask(0177) before bind so the socket is created directly as 0600
+# (no execute bit ever present during creation).
+#
+# Test strategy:
+#   A. Start outer-session so there is an [attached] session in the directory.
+#   B. Simulate being inside outer-session by setting ATCH_SESSION.
+#   C. Run `atch start inner-session` — no client must ever attach.
+#   D. Check socket mode immediately: S_IXUSR must NOT be set.
+#   E. Check `atch list`: inner-session must NOT show [attached].
+
+"$ATCH" start sis-outer sleep 999
+wait_socket sis-outer
+SIS_OUTER_SOCK="$HOME/.cache/atch/sis-outer"
+
+# Attach to outer via python so it shows [attached] — this mirrors the real
+# scenario where the user is inside the outer session.
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$SIS_OUTER_SOCK" << 'PYEOF' &
+import socket, struct, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall(struct.pack('BB8s', 1, 0, b'\x00' * 8))  # MSG_ATTACH
+time.sleep(15)
+s.close()
+PYEOF
+    SIS_ATTACH_PID=$!
+    sleep 0.1
+
+    # Start inner-session as if we are inside outer-session (ATCH_SESSION set)
+    ATCH_SESSION="$SIS_OUTER_SOCK" "$ATCH" start sis-inner sleep 999
+    wait_socket sis-inner
+    SIS_INNER_SOCK="$HOME/.cache/atch/sis-inner"
+
+    # Check socket mode immediately after start: no S_IXUSR allowed.
+    # The owner execute bit (S_IXUSR) is the bit 0 of the hundreds digit
+    # in the 3-digit octal representation (i.e., digit is 1, 3, 5, or 7).
+    # We extract the hundreds digit and test whether it is odd.
+    SOCK_MODE=$(stat -c "%a" "$SIS_INNER_SOCK" 2>/dev/null || \
+                stat -f "%Lp" "$SIS_INNER_SOCK" 2>/dev/null || echo "unknown")
+    # Hundreds digit: remove last two chars → first char of 3-digit mode
+    OWNER_DIGIT="${SOCK_MODE%??}"
+    case "$OWNER_DIGIT" in
+        1|3|5|7)
+            fail "start-inside: socket mode must not have S_IXUSR" \
+                 "owner digit 0,2,4 or 6 (no execute)" "$OWNER_DIGIT (mode $SOCK_MODE)" ;;
+        *)
+            ok "start-inside: socket created without S_IXUSR (mode $SOCK_MODE)" ;;
+    esac
+
+    # Check list: inner-session must NOT appear as [attached]
+    run "$ATCH" list
+    assert_not_contains \
+        "start-inside: inner session not shown as [attached] in list" \
+        "[attached]" \
+        "$(echo "$out" | grep sis-inner)"
+
+    kill $SIS_ATTACH_PID 2>/dev/null
+    wait $SIS_ATTACH_PID 2>/dev/null
+
+    tidy sis-outer
+    tidy sis-inner
+else
+    ok "start-inside: skip (python3 not available)"
+    ok "start-inside: skip (python3 not available)"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 
 printf "\n1..%d\n" "$T"

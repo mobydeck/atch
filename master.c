@@ -246,17 +246,28 @@ static int create_socket(char *name)
 	if (strlen(name) > sizeof(sockun.sun_path) - 1)
 		return socket_with_chdir(name, create_socket);
 
-	omask = umask(077);
+	/*
+	** Use umask(0177) during bind so the kernel creates the socket file
+	** with mode 0600 directly (0777 & ~0177 = 0600).  This ensures
+	** S_IXUSR is never set on the socket file at any point during
+	** creation, eliminating the TOCTOU window between bind(2) and the
+	** subsequent chmod(2) that would otherwise let `atch list` briefly
+	** see a newly-started session as [attached].
+	*/
+	omask = umask(0177);
 	s = socket(PF_UNIX, SOCK_STREAM, 0);
-	umask(omask);		/* umask always succeeds, errno is untouched. */
-	if (s < 0)
+	if (s < 0) {
+		umask(omask);
 		return -1;
+	}
 	sockun.sun_family = AF_UNIX;
 	memcpy(sockun.sun_path, name, strlen(name) + 1);
 	if (bind(s, (struct sockaddr *)&sockun, sizeof(sockun)) < 0) {
+		umask(omask);
 		close(s);
 		return -1;
 	}
+	umask(omask);		/* umask always succeeds, errno is untouched. */
 	if (listen(s, 128) < 0) {
 		close(s);
 		return -1;
@@ -265,7 +276,7 @@ static int create_socket(char *name)
 		close(s);
 		return -1;
 	}
-	/* chmod it to prevent any surprises */
+	/* chmod it to enforce 0600 regardless of platform quirks */
 	if (chmod(name, 0600) < 0) {
 		close(s);
 		return -1;
