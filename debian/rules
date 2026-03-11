@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+DEB_VERSION = $(shell dpkg-parsechangelog -S Version | sed 's/~.*//')
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) attach.o master.o atch.o VERSION=$(DEB_VERSION)
+	$(CC) -o atch $(LDFLAGS) attach.o master.o atch.o -lutil
+	$(MAKE) man
+
+override_dh_auto_install:
+	install -D -m 755 atch debian/atch/usr/bin/atch
+	install -D -m 644 atch.1 debian/atch/usr/share/man/man1/atch.1
+
+override_dh_auto_test:
+
+override_dh_auto_clean:
+	$(MAKE) clean

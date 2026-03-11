@@ -1,0 +1,17 @@
+Source: atch
+Section: utils
+Priority: optional
+Maintainer: Matt <matt@localhost>
+Build-Depends: debhelper-compat (= 13), pandoc
+Standards-Version: 4.6.2
+Homepage: https://github.com/mattsawyer77/atch
+
+Package: atch
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Attach and detach terminal sessions
+ atch is a small C utility that lets you attach and detach terminal sessions,
+ similar to the detach feature of screen/tmux but without terminal emulation,
+ multiple windows, or other overhead. The raw byte stream flows directly from
+ the pty to your terminal, so mouse, scroll, colours, and graphics all work
+ unmodified.
