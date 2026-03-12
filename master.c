@@ -89,6 +89,7 @@ static int open_log(const char *path)
 
 	log_fd = fd;
 	rotate_log();
+	log_written = (size_t)lseek(log_fd, 0, SEEK_CUR);
 	return fd;
 }
 
