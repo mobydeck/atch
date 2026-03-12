@@ -1,0 +1,272 @@
+.TH ATCH 1 "2024" "atch" "User Commands"
+.SH NAME
+atch \- terminal session manager with persistent history and multi-client attach
+.SH SYNOPSIS
+.B atch
+[\fIoptions\fR] [\fIsession\fR [\fIcommand...\fR]]
+.br
+.B atch
+\fIcommand\fR [\fIoptions\fR] ...
+.SH DESCRIPTION
+.B atch
+is a lightweight terminal session manager for macOS (and Linux).
+It creates a pseudo-terminal (PTY) managed by a background master process,
+allowing multiple clients to attach and detach at will.
+Session output is persisted to a disk log so that late-joining clients can
+replay what they missed.
+.PP
+The simplest invocation is:
+.PP
+.RS
+.B atch \fIsession\fR
+.RE
+.PP
+This attaches to an existing session named \fIsession\fR, or creates it (running
+your shell) if it does not yet exist.
+.PP
+A session name without a slash is resolved to a socket under
+\fI~/.cache/atch/\fR.  A name that contains a slash is used as a full socket
+path, which may reside anywhere the current user can write to.
+.SH COMMANDS
+.TP
+.BR "atch " [\fIsession\fR " [" \fIcommand...\fR ]]
+Attach-or-create.  If \fIsession\fR exists, attach to it.  If not, create it
+(running \fIcommand\fR, or the user's shell when no command is given) and
+attach.  Requires a TTY.
+.TP
+.B atch attach \fIsession\fR
+.br
+Aliases: \fBa\fR
+.br
+Strict attach.  Fail with exit code 1 if \fIsession\fR does not exist.
+Requires a TTY.
+.TP
+.B atch new \fIsession\fR [\fIcommand...\fR]
+.br
+Alias: \fBn\fR
+.br
+Create a new session running \fIcommand\fR (or the user's shell if omitted) and
+immediately attach to it.  Requires a TTY.
+.TP
+.B atch start \fIsession\fR [\fIcommand...\fR]
+.br
+Alias: \fBs\fR
+.br
+Create a new session in the background (detached).  Exits immediately after the
+master process is launched.  Does not require a TTY.
+.TP
+.B atch run \fIsession\fR [\fIcommand...\fR]
+Create a new session with the master process staying in the foreground
+(no fork).  Useful for supervisor-managed processes or debugging.
+.TP
+.B atch push \fIsession\fR
+.br
+Alias: \fBp\fR
+.br
+Read from standard input and send the bytes verbatim to \fIsession\fR.
+Useful for scripted input injection.  Does not require a TTY.
+.TP
+.B atch kill [\fB\-f\fR|\fB\-\-force\fR] \fIsession\fR
+.br
+Alias: \fBk\fR
+.br
+Stop \fIsession\fR by sending SIGTERM to the child process group, waiting for a
+short grace period, then sending SIGKILL if the process has not exited.  With
+\fB\-f\fR or \fB\-\-force\fR, SIGKILL is sent immediately without a grace
+period.
+.TP
+.B atch clear [\fIsession\fR]
+Truncate the on-disk log of \fIsession\fR to zero bytes.  If \fIsession\fR is
+omitted and the environment variable \fBATCH_SESSION\fR is set (i.e. the
+command is run from within an atch session), the innermost session in the
+ancestry chain is cleared.
+.TP
+.B atch list
+.br
+Aliases: \fBl\fR, \fBls\fR
+.br
+List all sessions in the default session directory.  Each entry shows the
+session name, age, and whether the socket is alive or stale (\fB[stale]\fR).
+.TP
+.B atch current
+Print the name of the current session (read from \fBATCH_SESSION\fR).  When
+nested, the full ancestry chain is printed, separated by \fB>\fR.  Exits with
+code 1 when not inside an atch session.
+.SH OPTIONS
+The following options may appear before or after the subcommand (except where
+noted).  Options that take an argument (\fB\-e\fR, \fB\-r\fR, \fB\-R\fR,
+\fB\-C\fR) consume the next argument.
+.TP
+.BI \-e " char"
+Set the detach character.  \fIchar\fR may be a literal character or a caret
+notation such as \fB^A\fR, \fB^B\fR, etc.  Use \fB^?\fR for DEL.  The default
+detach character is \fB^\\\fR (Ctrl-Backslash).
+.TP
+.B \-E
+Disable the detach character entirely.  Typing the detach sequence will be
+forwarded to the session instead of causing a detach.
+.TP
+.BI \-r " method"
+Set the redraw method used when reattaching.  \fImethod\fR is one of:
+.RS
+.TP
+.B none
+No automatic redraw.
+.TP
+.B ctrl_l
+Send a Ctrl-L character (form-feed) to the session.
+.TP
+.B winch
+Send a SIGWINCH signal to the session (the default when a TTY is present).
+.RE
+.TP
+.BI \-R " method"
+Set the clear method used when reattaching.  \fImethod\fR is one of:
+.RS
+.TP
+.B none
+No automatic clear (default).
+.TP
+.B move
+Clear by moving the cursor.
+.RE
+.TP
+.B \-z
+Disable the suspend key (Ctrl-Z).  When set, the suspend character is
+forwarded to the session rather than suspending the client.
+.TP
+.B \-q
+Quiet mode.  Suppress informational messages such as "session created" or
+"session stopped".  Error messages are not suppressed.
+.TP
+.B \-t
+Disable VT100/ANSI terminal assumptions.  Use this when the local terminal is
+not an ANSI-compatible terminal.
+.TP
+.BI \-C " size"
+Set the maximum on-disk log size.  Older bytes are trimmed when the log grows
+beyond this limit.  \fIsize\fR may be a plain integer (bytes), or a number
+followed by \fBk\fR/\fBK\fR (kibibytes) or \fBm\fR/\fBM\fR (mebibytes).
+Use \fB0\fR to disable logging entirely.  The default is \fB1m\fR (1 MiB).
+.TP
+.B \-f ", " \-\-force
+Only valid with the \fBkill\fR subcommand.  Skip the SIGTERM grace period and
+send SIGKILL immediately.
+.SH FILES
+.TP
+.I ~/.cache/atch/<session>
+Unix domain socket for the named session.
+.TP
+.I ~/.cache/atch/<session>.log
+Persistent output log for the named session.  The log is trimmed to the cap
+set by \fB\-C\fR (default 1 MiB) every time the limit is reached.  When a
+session ends, an end marker is appended before the file is closed.
+.PP
+When \fI$HOME\fR is unset or is the root directory, sockets are stored under
+\fI/tmp/.atch-<uid>/\fR instead.
+.SH ENVIRONMENT
+.TP
+.B ATCH_SESSION
+Set by \fBatch\fR in the environment of every child process it spawns.
+Contains the colon-separated ancestry chain of socket paths (outermost first),
+ending with the socket of the innermost (current) session.  For a
+non-nested session, the value is a single socket path with no colon.
+.PP
+The environment variable name is derived from the basename of the \fBatch\fR
+binary at startup: non-alphanumeric characters are replaced with underscores
+and the result is uppercased, then \fB_SESSION\fR is appended.  For example,
+a binary named \fBssh2incus-atch\fR uses \fBSSH2INCUS_ATCH_SESSION\fR.
+.TP
+.B HOME
+Used to locate the default session directory.  See \fBFILES\fR above.
+.TP
+.B SHELL
+Used as the default command when no \fIcommand\fR is given to \fBnew\fR,
+\fBstart\fR, or the implicit attach-or-create form.  Falls back to the passwd
+database and then to \fI/bin/sh\fR.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error occurred (session not found, no TTY available, invalid arguments, etc.)
+or the invoked command exited with a non-zero status.
+.SH EXAMPLES
+Create a new session named \fBwork\fR and attach to it:
+.PP
+.RS
+.B atch work
+.RE
+.PP
+Or equivalently:
+.PP
+.RS
+.B atch new work
+.RE
+.PP
+Detach from the current session by typing the detach sequence \fBCtrl-\\\fR.
+.PP
+List all sessions:
+.PP
+.RS
+.B atch list
+.RE
+.PP
+Reattach to a running session:
+.PP
+.RS
+.B atch attach work
+.RE
+.PP
+Start a long-running process in the background, without a terminal:
+.PP
+.RS
+.B atch start build make -j8
+.RE
+.PP
+Inject a command into a running session:
+.PP
+.RS
+.B printf 'echo hello\en' | atch push work
+.RE
+.PP
+Stop a session gracefully:
+.PP
+.RS
+.B atch kill work
+.RE
+.PP
+Stop a session immediately (no grace period):
+.PP
+.RS
+.B atch kill -f work
+.RE
+.PP
+Truncate the session log:
+.PP
+.RS
+.B atch clear work
+.RE
+.PP
+Show the current session name from inside a session:
+.PP
+.RS
+.B atch current
+.RE
+.PP
+Start a session with a custom detach character and 512 KiB log cap:
+.PP
+.RS
+.B atch start -e '^A' -C 512k myapp ./myapp
+.RE
+.SH SEE ALSO
+.BR dtach (1),
+.BR tmux (1),
+.BR screen (1),
+.BR nohup (1)
+.SH BUGS
+Report bugs at \fIhttps://github.com/mobydeck/atch\fR.
+.SH AUTHORS
+Originally written by the mobydeck team.
+macOS fork maintained at \fIhttps://github.com/mobydeck/atch\fR.
