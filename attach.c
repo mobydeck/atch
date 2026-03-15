@@ -8,13 +8,113 @@
 #endif
 #endif
 
+/* ── ancestry helpers ────────────────────────────────────────────────────── */
+
+/*
+** Return the parent PID of 'pid'.
+** Returns 0 on failure (pid not found or permission denied).
+** Portable across Linux (/proc) and macOS (libproc / sysctl).
+*/
+#ifdef __APPLE__
+#include <libproc.h>
+static pid_t get_parent_pid(pid_t pid)
+{
+	struct proc_bsdinfo info;
+
+	if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0,
+			 &info, sizeof(info)) <= 0)
+		return 0;
+	return (pid_t)info.pbi_ppid;
+}
+#else
+static pid_t get_parent_pid(pid_t pid)
+{
+	char path[64];
+	FILE *f;
+	pid_t ppid = 0;
+	char line[256];
+
+	snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+	f = fopen(path, "r");
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "PPid: %d", &ppid) == 1)
+			break;
+	}
+	fclose(f);
+	return ppid;
+}
+#endif
+
+/*
+** Return 1 if 'ancestor_pid' is equal to, or an ancestor of, 'child_pid'.
+** Walks the process tree upward; gives up after 1024 steps to avoid loops.
+*/
+static int is_ancestor(pid_t ancestor_pid, pid_t child_pid)
+{
+	pid_t p = child_pid;
+	int steps = 0;
+
+	while (p > 1 && steps < 1024) {
+		if (p == ancestor_pid)
+			return 1;
+		p = get_parent_pid(p);
+		steps++;
+	}
+	/* Also check the final value (handles the p == ancestor_pid == 1 edge) */
+	return (p == ancestor_pid);
+}
+
+/*
+** Read the session shell PID from '<sockpath>.ppid'.
+** Returns 0 if the file does not exist or cannot be read.
+*/
+static pid_t read_session_ppid(const char *sockpath)
+{
+	char ppid_path[600];
+	FILE *f;
+	long pid = 0;
+
+	snprintf(ppid_path, sizeof(ppid_path), "%s.ppid", sockpath);
+	f = fopen(ppid_path, "r");
+	if (!f)
+		return 0;
+	if (fscanf(f, "%ld", &pid) != 1)
+		pid = 0;
+	fclose(f);
+	return (pid > 0) ? (pid_t)pid : 0;
+}
+
+/*
+** Return 1 if the current process is genuinely running inside the session
+** whose socket path is 'sockpath'.
+**
+** The check reads '<sockpath>.ppid' (written by the master when it forks
+** the pty child) and tests whether that PID is an ancestor of the calling
+** process.  If the file is absent or the PID is no longer an ancestor,
+** the ATCH_SESSION variable is considered stale and the guard is skipped.
+*/
+static int session_is_ancestor(const char *sockpath)
+{
+	pid_t shell_pid = read_session_ppid(sockpath);
+
+	if (shell_pid <= 0)
+		return 0;	/* no .ppid file → assume stale */
+	return is_ancestor(shell_pid, getpid());
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+
 /*
 ** The current terminal settings. After coming back from a suspend, we
 ** restore this.
 */
 static struct termios cur_term;
 /* 1 if the window size changed */
-static int win_changed;
+static volatile sig_atomic_t win_changed;
+/* Non-zero if a fatal signal was received; stores the signal number. */
+static volatile sig_atomic_t die_signal;
 /* Socket creation time, used to compute session age in messages. */
 time_t session_start;
 
@@ -27,58 +127,90 @@ char const *clear_csi_data(void)
 	return "\033[999H\r\n";
 }
 
-/* Write buf to fd handling partial writes. Exit on failure. */
-void write_buf_or_fail(int fd, const void *buf, size_t count)
+/* Exit promptly once the main thread notices a fatal signal.
+ * If terminal output itself is wedged, skip stdio entirely. */
+static void exit_for_deferred_signal(int can_print)
+{
+	int sig = die_signal;
+	char age[32];
+
+	if (!sig)
+		return;
+	if (!can_print) {
+		tcsetattr(0, TCSANOW, &orig_term);
+		_exit(1);
+	}
+	session_age(age, sizeof(age));
+	if (sig == SIGHUP || sig == SIGINT)
+		printf("%s[%s: session '%s' detached after %s]\r\n",
+		       clear_csi_data(), progname, session_shortname(), age);
+	else
+		printf("%s[%s: session '%s' got signal %d - exiting after %s]\r\n",
+		       clear_csi_data(), progname, session_shortname(), sig, age);
+	exit(1);
+}
+
+/* Write all of buf to fd, retrying on short writes and EINTR.
+** Returns 0 on success, -1 on failure (errno is set). */
+static int write_all(int fd, const void *buf, size_t count)
 {
 	while (count != 0) {
 		ssize_t ret = write(fd, buf, count);
 
-		if (ret >= 0) {
+		if (ret > 0) {
 			buf = (const char *)buf + ret;
 			count -= ret;
-		} else if (ret < 0 && errno == EINTR)
+		} else if (ret < 0 && errno == EINTR) {
+			if (die_signal)
+				return -1;
 			continue;
-		else {
-			if (session_start) {
-				char age[32];
-				session_age(age, sizeof(age));
-				printf
-				    ("%s[%s: session '%s' write failed after %s]\r\n",
-				     clear_csi_data(), progname,
-				     session_shortname(), age);
-			} else {
-				printf("%s[%s: write failed]\r\n",
-				       clear_csi_data(), progname);
-			}
-			exit(1);
+		} else {
+			/* ret == 0 (no progress) or ret < 0 (real error) */
+			if (ret == 0)
+				errno = EIO;
+			return -1;
 		}
+	}
+	return 0;
+}
+
+/* Write buf to fd handling partial writes. Exit on failure. */
+void write_buf_or_fail(int fd, const void *buf, size_t count)
+{
+	if (write_all(fd, buf, count) < 0) {
+		exit_for_deferred_signal(fd != 1);
+		if (session_start) {
+			char age[32];
+			session_age(age, sizeof(age));
+			printf
+			    ("%s[%s: session '%s' write failed after %s]\r\n",
+			     clear_csi_data(), progname,
+			     session_shortname(), age);
+		} else {
+			printf("%s[%s: write failed]\r\n",
+			       clear_csi_data(), progname);
+		}
+		exit(1);
 	}
 }
 
 /* Write pkt to fd. Exit on failure. */
 void write_packet_or_fail(int fd, const struct packet *pkt)
 {
-	while (1) {
-		ssize_t ret = write(fd, pkt, sizeof(struct packet));
-
-		if (ret == sizeof(struct packet))
-			return;
-		else if (ret < 0 && errno == EINTR)
-			continue;
-		else {
-			if (session_start) {
-				char age[32];
-				session_age(age, sizeof(age));
-				printf
-				    ("%s[%s: session '%s' write failed after %s]\r\n",
-				     clear_csi_data(), progname,
-				     session_shortname(), age);
-			} else {
-				printf("%s[%s: write failed]\r\n",
-				       clear_csi_data(), progname);
-			}
-			exit(1);
+	if (write_all(fd, pkt, sizeof(struct packet)) < 0) {
+		exit_for_deferred_signal(fd != 1);
+		if (session_start) {
+			char age[32];
+			session_age(age, sizeof(age));
+			printf
+			    ("%s[%s: session '%s' write failed after %s]\r\n",
+			     clear_csi_data(), progname,
+			     session_shortname(), age);
+		} else {
+			printf("%s[%s: write failed]\r\n",
+			       clear_csi_data(), progname);
 		}
+		exit(1);
 	}
 }
 
@@ -149,26 +281,15 @@ void session_age(char *buf, size_t size)
 	format_age(now > session_start ? now - session_start : 0, buf, size);
 }
 
-/* Signal */
+/* Signal -- only set a flag; all non-trivial work happens in the main loop. */
 static RETSIGTYPE die(int sig)
 {
-	char age[32];
-	session_age(age, sizeof(age));
-	/* Print a nice pretty message for some things. */
-	if (sig == SIGHUP || sig == SIGINT)
-		printf("%s[%s: session '%s' detached after %s]\r\n",
-		       clear_csi_data(), progname, session_shortname(), age);
-	else
-		printf
-		    ("%s[%s: session '%s' got signal %d - exiting after %s]\r\n",
-		     clear_csi_data(), progname, session_shortname(), sig, age);
-	exit(1);
+	die_signal = sig;
 }
 
-/* Window size change. */
+/* Window size change -- only set a flag. */
 static RETSIGTYPE win_change(ATTRIBUTE_UNUSED int sig)
 {
-	signal(SIGWINCH, win_change);
 	win_changed = 1;
 }
 
@@ -203,6 +324,13 @@ static void process_kbd(int s, struct packet *pkt)
 	else if (pkt->u.buf[0] == detach_char) {
 		char age[32];
 		session_age(age, sizeof(age));
+		/* Tell the master we are detaching so it clears S_IXUSR on
+		 * the socket immediately, before this process exits.
+		 * Without this, the master only learns about the detach when
+		 * it receives EOF on close(), which can race with a concurrent
+		 * `atch list` reading the stale S_IXUSR bit. */
+		pkt->type = MSG_DETACH;
+		write_packet_or_fail(s, pkt);
 		printf("%s[%s: session '%s' detached after %s]\r\n",
 		       clear_csi_data(), progname, session_shortname(), age);
 		exit(0);
@@ -224,7 +352,12 @@ static int log_already_replayed;
 ** killed/crashed (socket still on disk), ENOENT means clean exit (socket was
 ** unlinked; end marker is already in the log).
 ** Pass 0 when replaying for a running session (no end message printed).
-** Returns 1 if a log was found and replayed, 0 if no log exists. */
+** Returns 1 if a log was found and replayed, 0 if no log exists.
+**
+** Only the last SCROLLBACK_SIZE bytes of the log are replayed to avoid
+** overwhelming the terminal when attaching to a session with a large log
+** (e.g. a long-running build).  This matches the in-memory ring-buffer cap
+** used when replaying a live session's scrollback. */
 int replay_session_log(int saved_errno)
 {
 	char log_path[600];
@@ -239,6 +372,18 @@ int replay_session_log(int saved_errno)
 	{
 		unsigned char rbuf[BUFSIZE];
 		ssize_t n;
+		off_t log_size;
+
+		/* Seek to the last SCROLLBACK_SIZE bytes so that a very large
+		 * log (e.g. from a long build session) does not flood the
+		 * terminal.  If the log is smaller than SCROLLBACK_SIZE, start
+		 * from the beginning. */
+		log_size = lseek(logfd, 0, SEEK_END);
+		if (log_size > (off_t)SCROLLBACK_SIZE)
+			lseek(logfd, log_size - (off_t)SCROLLBACK_SIZE,
+			      SEEK_SET);
+		else
+			lseek(logfd, 0, SEEK_SET);
 
 		while ((n = read(logfd, rbuf, sizeof(rbuf))) > 0)
 			write(1, rbuf, (size_t)n);
@@ -256,6 +401,57 @@ int replay_session_log(int saved_errno)
 	return 1;
 }
 
+/*
+** Check whether attaching to 'sockname' would be a self-attach (i.e. the
+** current process is running inside that session's ancestry chain).
+**
+** Returns 1 and prints an error if a genuine self-attach is detected.
+** Returns 0 if the attach may proceed.
+**
+** Called before require_tty() so that the correct diagnostic is shown even
+** when there is no terminal available.
+*/
+int check_attach_ancestry(void)
+{
+	const char *tosearch = getenv(SESSION_ENVVAR);
+
+	if (!tosearch || !*tosearch)
+		return 0;
+
+	{
+		size_t slen = strlen(sockname);
+		const char *p = tosearch;
+
+		while (*p) {
+			const char *colon = strchr(p, ':');
+			size_t tlen =
+			    colon ? (size_t)(colon - p) : strlen(p);
+
+			if (tlen == slen
+			    && strncmp(p, sockname, tlen) == 0) {
+				/* Verify we are genuinely inside this
+				 * session before blocking the attach.
+				 * session_is_ancestor() reads the .ppid
+				 * file written by the master and checks
+				 * the process ancestry; if the file is
+				 * absent or the PID is not an ancestor,
+				 * ATCH_SESSION is stale → allow attach. */
+				if (session_is_ancestor(sockname)) {
+					printf
+					    ("%s: cannot attach to session '%s' from within itself\n",
+					     progname, session_shortname());
+					return 1;
+				}
+				/* Stale ATCH_SESSION — fall through. */
+			}
+			if (!colon)
+				break;
+			p = colon + 1;
+		}
+	}
+	return 0;
+}
+
 int attach_main(int noerror)
 {
 	struct packet pkt;
@@ -266,34 +462,13 @@ int attach_main(int noerror)
 	/* Refuse to attach to any session in our ancestry chain (catches both
 	 * direct self-attach and indirect loops like A -> B -> A).
 	 * SESSION_ENVVAR is the colon-separated chain, so scanning it covers
-	 * all ancestors. */
-	{
-		const char *tosearch = getenv(SESSION_ENVVAR);
-
-		if (tosearch && *tosearch) {
-			size_t slen = strlen(sockname);
-			const char *p = tosearch;
-
-			while (*p) {
-				const char *colon = strchr(p, ':');
-				size_t tlen =
-				    colon ? (size_t)(colon - p) : strlen(p);
-
-				if (tlen == slen
-				    && strncmp(p, sockname, tlen) == 0) {
-					if (!noerror)
-						printf
-						    ("%s: cannot attach to session '%s' from within itself\n",
-						     progname,
-						     session_shortname());
-					return 1;
-				}
-				if (!colon)
-					break;
-				p = colon + 1;
-			}
-		}
-	}
+	 * all ancestors.
+	 *
+	 * The check is performed via check_attach_ancestry(), which is also
+	 * called early in the command handlers (before require_tty) so the
+	 * correct error is shown even without a terminal. */
+	if (check_attach_ancestry())
+		return 1;
 
 	/* Attempt to open the socket. Don't display an error if noerror is
 	 ** set. */
@@ -303,23 +478,23 @@ int attach_main(int noerror)
 		const char *name = session_shortname();
 
 		if (!noerror) {
-			if (!replay_session_log(saved_errno)) {
-				if (saved_errno == ENOENT)
-					printf
-					    ("%s: session '%s' does not exist\n",
-					     progname, name);
-				else if (saved_errno == ECONNREFUSED)
-					printf
-					    ("%s: session '%s' is not running\n",
-					     progname, name);
-				else if (saved_errno == ENOTSOCK)
-					printf
-					    ("%s: '%s' is not a valid session\n",
-					     progname, name);
-				else
-					printf("%s: %s: %s\n", progname,
-					       sockname, strerror(saved_errno));
-			}
+			/* Strict attach: just print the error, never
+			 * replay the log.  Use 'tail' to view logs. */
+			if (saved_errno == ENOENT)
+				printf
+				    ("%s: session '%s' does not exist\n",
+				     progname, name);
+			else if (saved_errno == ECONNREFUSED)
+				printf
+				    ("%s: session '%s' is not running\n",
+				     progname, name);
+			else if (saved_errno == ENOTSOCK)
+				printf
+				    ("%s: '%s' is not a valid session\n",
+				     progname, name);
+			else
+				printf("%s: %s: %s\n", progname,
+				       sockname, strerror(saved_errno));
 		}
 		return 1;
 	}
@@ -344,14 +519,32 @@ int attach_main(int noerror)
 	/* Set a trap to restore the terminal when we die. */
 	atexit(restore_term);
 
-	/* Set some signals. */
-	signal(SIGPIPE, SIG_IGN);
-	signal(SIGXFSZ, SIG_IGN);
-	signal(SIGHUP, die);
-	signal(SIGTERM, die);
-	signal(SIGINT, die);
-	signal(SIGQUIT, die);
-	signal(SIGWINCH, win_change);
+	/* Set some signals using sigaction to avoid SA_RESTART ambiguity. */
+	{
+		struct sigaction sa_ign, sa_die, sa_winch;
+
+		memset(&sa_ign, 0, sizeof(sa_ign));
+		sa_ign.sa_handler = SIG_IGN;
+		sigemptyset(&sa_ign.sa_mask);
+		sigaction(SIGPIPE, &sa_ign, NULL);
+		sigaction(SIGXFSZ, &sa_ign, NULL);
+
+		memset(&sa_die, 0, sizeof(sa_die));
+		sa_die.sa_handler = die;
+		sigemptyset(&sa_die.sa_mask);
+		/* No SA_RESTART: let select() return EINTR so the loop
+		 * notices die_signal promptly. */
+		sigaction(SIGHUP, &sa_die, NULL);
+		sigaction(SIGTERM, &sa_die, NULL);
+		sigaction(SIGINT, &sa_die, NULL);
+		sigaction(SIGQUIT, &sa_die, NULL);
+
+		memset(&sa_winch, 0, sizeof(sa_winch));
+		sa_winch.sa_handler = win_change;
+		sigemptyset(&sa_winch.sa_mask);
+		sa_winch.sa_flags = SA_RESTART;  /* benign — don't interrupt I/O */
+		sigaction(SIGWINCH, &sa_winch, NULL);
+	}
 
 	/* Set raw mode. */
 	cur_term.c_iflag &=
@@ -396,10 +589,16 @@ int attach_main(int noerror)
 	while (1) {
 		int n;
 
+		exit_for_deferred_signal(1);
+
 		FD_ZERO(&readfds);
 		FD_SET(0, &readfds);
 		FD_SET(s, &readfds);
 		n = select(s + 1, &readfds, NULL, NULL, NULL);
+
+		/* Check for deferred fatal signal. */
+		exit_for_deferred_signal(1);
+
 		if (n < 0 && errno != EINTR && errno != EAGAIN) {
 			char age[32];
 			session_age(age, sizeof(age));
@@ -425,6 +624,8 @@ int attach_main(int noerror)
 				}
 				exit(0);
 			} else if (len < 0) {
+				if (errno == EINTR)
+					continue;
 				char age[32];
 				session_age(age, sizeof(age));
 				printf
@@ -445,6 +646,8 @@ int attach_main(int noerror)
 			memset(pkt.u.buf, 0, sizeof(pkt.u.buf));
 			len = read(0, pkt.u.buf, sizeof(pkt.u.buf));
 
+			if (len < 0 && errno == EINTR)
+				continue;
 			if (len <= 0)
 				exit(1);
 
@@ -497,11 +700,7 @@ int push_main()
 		}
 
 		pkt.len = len;
-		len = write(s, &pkt, sizeof(struct packet));
-		if (len != sizeof(struct packet)) {
-			if (len >= 0)
-				errno = EPIPE;
-
+		if (write_all(s, &pkt, sizeof(struct packet)) < 0) {
 			printf("%s: %s: %s\n", progname, sockname,
 			       strerror(errno));
 			return 1;
@@ -521,9 +720,9 @@ static int send_kill(int sig)
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.type = MSG_KILL;
 	pkt.len = (unsigned char)sig;
-	ret = write(s, &pkt, sizeof(pkt));
+	ret = write_all(s, &pkt, sizeof(pkt));
 	close(s);
-	return (ret == sizeof(pkt)) ? 0 : -1;
+	return ret;
 }
 
 static int session_gone(void)

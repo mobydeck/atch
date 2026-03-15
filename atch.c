@@ -76,11 +76,17 @@ int socket_with_chdir(char *path, int (*fn)(char *))
 	*slash = '\0';
 	s = chdir(path) >= 0 ? fn(slash + 1) : -1;
 	*slash = '/';
-	if (s >= 0 && fchdir(dirfd) < 0) {
-		close(s);
-		s = -1;
+	/* Always restore cwd, regardless of socket operation result */
+	{
+		int saved_errno = errno;
+		if (fchdir(dirfd) < 0) {
+			if (s >= 0) close(s);
+			close(dirfd);
+			return -1;
+		}
+		close(dirfd);
+		errno = saved_errno;
 	}
-	close(dirfd);
 	return s;
 }
 
@@ -275,6 +281,10 @@ static void expand_sockname(void)
 	mkdir(dir, 0700);
 	fulllen = strlen(dir) + 1 + strlen(sockname);
 	full = malloc(fulllen + 1);
+	if (!full) {
+		printf("%s: out of memory\n", progname);
+		exit(1);
+	}
 	snprintf(full, fulllen + 1, "%s/%s", dir, sockname);
 	sockname = full;
 }
@@ -407,6 +417,9 @@ static int cmd_attach(int argc, char **argv)
 		printf("Try '%s --help' for more information.\n", progname);
 		return 1;
 	}
+	/* Check ancestry before TTY so the correct error is shown first. */
+	if (check_attach_ancestry())
+		return 1;
 	save_term();
 	if (require_tty())
 		return 1;
@@ -835,6 +848,11 @@ int main(int argc, char **argv)
 			return 1;
 		if (mode != 'a')
 			argv = use_shell_if_no_cmd(argc, argv);
+		/* Check ancestry before TTY so the correct error fires first. */
+		if (mode == 'a' || mode == 'A' || mode == 'c') {
+			if (check_attach_ancestry())
+				return 1;
+		}
 		save_term();
 		if (dont_have_tty && mode != 'n' && mode != 'N') {
 			printf("%s: attaching to a session requires a "

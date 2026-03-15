@@ -4,6 +4,8 @@ CFLAGS = -g -O2 -W -Wall -I. -DPACKAGE_VERSION=\"$(VERSION)\"
 LDFLAGS =
 LIBS = -lutil
 
+PREFIX ?= /usr/local
+
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   STATIC_FLAG =
@@ -31,10 +33,16 @@ atch.1: atch.1.md
 
 man: atch.1
 
+install: atch
+	install -d $(PREFIX)/bin
+	install -m 755 atch $(PREFIX)/bin/atch
+	install -d $(PREFIX)/share/man/man1
+	install -m 644 atch.1 $(PREFIX)/share/man/man1/atch.1
+
 clean:
 	rm -f atch $(OBJ) *.1.md *.c~
 
-.PHONY: fmt
+.PHONY: install fmt
 fmt:
 	docker run --rm -v "$$PWD":/src -w /src alpine:latest sh -c "apk add --no-cache indent && indent -linux $(SRCS) && indent -linux $(SRCS)"
 

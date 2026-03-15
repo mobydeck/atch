@@ -115,6 +115,8 @@ struct packet
 		struct winsize ws;
 	} u;
 };
+_Static_assert(sizeof(((struct packet *)0)->u.buf) <= 255,
+	"packet buffer must fit in uint8_t length");
 
 /*
 ** The master sends a simple stream of text to the attaching clients, without
@@ -136,6 +138,7 @@ void get_session_dir(char *buf, size_t size);
 int socket_with_chdir(char *path, int (*fn)(char *));
 
 int replay_session_log(int saved_errno);
+int check_attach_ancestry(void);
 int attach_main(int noerror);
 int master_main(char **argv, int waitattach, int dontfork);
 int push_main(void);

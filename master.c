@@ -58,6 +58,9 @@ static void rotate_log(void)
 	char *buf;
 	ssize_t n;
 
+	if (log_fd < 0)
+		return;
+
 	size = lseek(log_fd, 0, SEEK_END);
 	if (size > (off_t) log_max_size) {
 		buf = malloc(log_max_size);
@@ -67,12 +70,18 @@ static void rotate_log(void)
 			if (n > 0) {
 				ftruncate(log_fd, 0);
 				lseek(log_fd, 0, SEEK_SET);
-				write(log_fd, buf, (size_t)n);
+				if (write(log_fd, buf, (size_t)n) < 0) {
+					close(log_fd);
+					log_fd = -1;
+					free(buf);
+					return;
+				}
 			}
 			free(buf);
 		}
 	}
-	lseek(log_fd, 0, SEEK_END);
+	if (log_fd >= 0)
+		lseek(log_fd, 0, SEEK_END);
 }
 
 /*
@@ -89,12 +98,32 @@ static int open_log(const char *path)
 
 	log_fd = fd;
 	rotate_log();
-	return fd;
+	log_written = (size_t)lseek(log_fd, 0, SEEK_CUR);
+	return log_fd;
+}
+
+/* Write the pty-child PID to <sockname>.ppid for ancestry verification. */
+static void write_session_ppid(pid_t pid)
+{
+	char ppid_path[600];
+	int fd;
+	char buf[32];
+	int len;
+
+	snprintf(ppid_path, sizeof(ppid_path), "%s.ppid", sockname);
+	fd = open(ppid_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return;
+	len = snprintf(buf, sizeof(buf), "%d\n", (int)pid);
+	write(fd, buf, (size_t)len);
+	close(fd);
 }
 
 /* Write end marker to log, close it, and unlink the socket. */
 static void cleanup_session(void)
 {
+	char ppid_path[600];
+
 	if (log_fd >= 0) {
 		time_t age = time(NULL) - master_start_time;
 		char agebuf[32];
@@ -109,6 +138,8 @@ static void cleanup_session(void)
 		log_fd = -1;
 	}
 	unlink(sockname);
+	snprintf(ppid_path, sizeof(ppid_path), "%s.ppid", sockname);
+	unlink(ppid_path);
 }
 
 /* Signal */
@@ -246,17 +277,28 @@ static int create_socket(char *name)
 	if (strlen(name) > sizeof(sockun.sun_path) - 1)
 		return socket_with_chdir(name, create_socket);
 
-	omask = umask(077);
+	/*
+	** Use umask(0177) during bind so the kernel creates the socket file
+	** with mode 0600 directly (0777 & ~0177 = 0600).  This ensures
+	** S_IXUSR is never set on the socket file at any point during
+	** creation, eliminating the TOCTOU window between bind(2) and the
+	** subsequent chmod(2) that would otherwise let `atch list` briefly
+	** see a newly-started session as [attached].
+	*/
+	omask = umask(0177);
 	s = socket(PF_UNIX, SOCK_STREAM, 0);
-	umask(omask);		/* umask always succeeds, errno is untouched. */
-	if (s < 0)
+	if (s < 0) {
+		umask(omask);
 		return -1;
+	}
 	sockun.sun_family = AF_UNIX;
 	memcpy(sockun.sun_path, name, strlen(name) + 1);
 	if (bind(s, (struct sockaddr *)&sockun, sizeof(sockun)) < 0) {
+		umask(omask);
 		close(s);
 		return -1;
 	}
+	umask(omask);		/* umask always succeeds, errno is untouched. */
 	if (listen(s, 128) < 0) {
 		close(s);
 		return -1;
@@ -265,7 +307,7 @@ static int create_socket(char *name)
 		close(s);
 		return -1;
 	}
-	/* chmod it to prevent any surprises */
+	/* chmod it to enforce 0600 regardless of platform quirks */
 	if (chmod(name, 0600) < 0) {
 		close(s);
 		return -1;
@@ -388,7 +430,12 @@ static void pty_activity(int s)
 	}
 	scrollback_append(buf, (size_t)len);
 	if (log_fd >= 0) {
-		write(log_fd, buf, (size_t)len);
+		if (write(log_fd, buf, (size_t)len) < 0) {
+			close(log_fd);
+			log_fd = -1;
+		}
+	}
+	if (log_fd >= 0) {
 		log_written += (size_t)len;
 		if (log_written >= log_max_size) {
 			rotate_log();
@@ -606,6 +653,12 @@ static void master_process(int s, char **argv, int waitattach, int statusfd)
 		exit(1);
 	}
 
+	/* Record the pty-child PID for ancestry verification in attach_main.
+	 * attach_main reads <sockname>.ppid to confirm that a process trying
+	 * to attach is genuinely running inside this session before blocking
+	 * a re-attach based on a potentially stale ATCH_SESSION value. */
+	write_session_ppid(the_pty.pid);
+
 	/* Set up some signals. */
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGXFSZ, SIG_IGN);
@@ -802,29 +855,29 @@ int
 openpty(int *amaster, int *aslave, char *name, struct termios *termp,
 	struct winsize *winp)
 {
-	int master, slave;
+	int master = -1, slave = -1;
 	char *buf;
 
 	master = open("/dev/ptmx", O_RDWR);
 	if (master < 0)
 		return -1;
 	if (grantpt(master) < 0)
-		return -1;
+		goto fail;
 	if (unlockpt(master) < 0)
-		return -1;
+		goto fail;
 	buf = ptsname(master);
 	if (!buf)
-		return -1;
+		goto fail;
 
 	slave = open(buf, O_RDWR | O_NOCTTY);
 	if (slave < 0)
-		return -1;
+		goto fail;
 
 #ifdef I_PUSH
 	if (ioctl(slave, I_PUSH, "ptem") < 0)
-		return -1;
+		goto fail;
 	if (ioctl(slave, I_PUSH, "ldterm") < 0)
-		return -1;
+		goto fail;
 #endif
 
 	*amaster = master;
@@ -836,6 +889,13 @@ openpty(int *amaster, int *aslave, char *name, struct termios *termp,
 	if (winp)
 		ioctl(slave, TIOCSWINSZ, winp);
 	return 0;
+
+fail:
+	if (master >= 0)
+		close(master);
+	if (slave >= 0)
+		close(slave);
+	return -1;
 }
 
 pid_t

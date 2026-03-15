@@ -1,8 +1,8 @@
 /.*
 !.gitignore
 *.o
+*.dSYM/
 *~
-*.1
 *.1.md
 /atch
 build/

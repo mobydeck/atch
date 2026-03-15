@@ -708,6 +708,147 @@ assert_contains "tail -n missing arg: message"       "-n requires an argument" "
 
 tidy s-tail
 
+# ── 21. replay_session_log: bounded replay (last SCROLLBACK_SIZE bytes only) ──
+#
+# Regression test for: replay_session_log must replay at most SCROLLBACK_SIZE
+# (128 KB) of the session log.  Without this cap, attaching a session with a
+# large log (e.g. a long-running build) causes an overwhelming scroll that
+# appears to loop indefinitely.
+#
+# Strategy: create a synthetic .log file larger than SCROLLBACK_SIZE (128 KB),
+# attach to the dead session using expect(1) to supply a PTY (required by
+# attach_main), and verify the output byte count and content.
+#
+# expect(1) is available on macOS by default and on most Linux distros.
+# If absent, the test is skipped.
+
+if command -v expect >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    mkdir -p "$HOME/.cache/atch"
+
+    REPLAY_SOCK="$HOME/.cache/atch/replay-cap-sess"
+    REPLAY_LOG="${REPLAY_SOCK}.log"
+
+    # Build a log of ~290 KB: OLD_DATA fills the first 160 KB,
+    # NEW_DATA fills the last 128 KB.  Only NEW_DATA should appear in replay.
+    python3 -c "
+import sys
+old = b'OLD_DATA_LINE_PADDED_TO_EXACTLY_32B\n'
+new = b'NEW_DATA_LINE_PADDED_TO_EXACTLY_32B\n'
+old_count = (160 * 1024) // len(old) + 1
+new_count = (128 * 1024) // len(new) + 1
+sys.stdout.buffer.write(old * old_count)
+sys.stdout.buffer.write(new * new_count)
+" > "$REPLAY_LOG"
+
+    # Use expect to run atch attach with a real PTY, capturing all output.
+    # atch exits immediately after replaying the log for a dead session.
+    REPLAY_OUT=$(mktemp)
+    expect - << EXPECT_EOF > "$REPLAY_OUT" 2>/dev/null
+set timeout 10
+spawn $ATCH attach replay-cap-sess
+expect eof
+EXPECT_EOF
+
+    OUT_BYTES=$(wc -c < "$REPLAY_OUT")
+
+    # Output must stay within SCROLLBACK_SIZE + some terminal-overhead margin
+    # (expect may inject a few extra bytes; 256 KB is a safe upper bound).
+    MAX_BYTES=262144
+    if [ "$OUT_BYTES" -le "$MAX_BYTES" ]; then
+        ok "replay-log: output bounded ($OUT_BYTES <= $MAX_BYTES bytes)"
+    else
+        fail "replay-log: output bounded" \
+             "<= $MAX_BYTES bytes" "$OUT_BYTES bytes"
+    fi
+
+    # Replayed content must come from the tail (NEW_DATA present).
+    if grep -q "NEW_DATA" "$REPLAY_OUT" 2>/dev/null; then
+        ok "replay-log: tail of log replayed (NEW_DATA present)"
+    else
+        fail "replay-log: tail of log replayed (NEW_DATA present)" \
+             "NEW_DATA in output" "not found"
+    fi
+
+    # HEAD of log must NOT appear (OLD_DATA absent).
+    if grep -q "OLD_DATA" "$REPLAY_OUT" 2>/dev/null; then
+        fail "replay-log: head of log skipped (OLD_DATA absent)" \
+             "no OLD_DATA" "OLD_DATA found"
+    else
+        ok "replay-log: head of log skipped (OLD_DATA absent)"
+    fi
+
+    rm -f "$REPLAY_OUT" "$REPLAY_LOG"
+else
+    ok "replay-log: skip (expect or python3 not available)"
+    ok "replay-log: skip (expect or python3 not available)"
+    ok "replay-log: skip (expect or python3 not available)"
+fi
+
+# ── 21b. ATCH_SESSION ancestry protection ────────────────────────────────────
+#
+# Regression test for the ATCH_SESSION stale-ancestry bug.
+#
+# The anti-recursion guard in attach_main must only fire when the current
+# process is genuinely a descendant of the target session.  It must NOT fire
+# when ATCH_SESSION merely contains the session path but the process is not
+# actually running inside that session (stale env var).
+#
+# Because attach_main is only reached after require_tty() in the normal
+# command path, we probe the guard by simulating the session's .ppid file:
+#
+#   • No .ppid file (or PID 0) → guard is bypassed → "does not exist" / "requires a terminal"
+#   • .ppid file with a PID that IS an ancestor of the current shell → guard fires
+#   • .ppid file with a PID that is NOT an ancestor (e.g. already-dead PID) → guard bypassed
+#
+# A session's .ppid file is written by the master and contains the PID of the
+# shell process running inside the pty (the_pty.pid).
+
+mkdir -p "$HOME/.cache/atch"
+
+# Case A: ATCH_SESSION holds a session path, NO .ppid file exists → no block
+GHOST_SOCK="$HOME/.cache/atch/ghost-session"
+# No socket, no .ppid — completely absent session
+run env ATCH_SESSION="$GHOST_SOCK" "$ATCH" attach ghost-session 2>&1
+assert_exit "ppid-guard: no ppid file → exit 1 (not self-attach)"  1 "$rc"
+assert_not_contains "ppid-guard: no ppid file → no self-attach msg" \
+    "from within itself" "$out"
+
+# Case B: .ppid file contains a dead / non-ancestor PID → guard must NOT fire
+"$ATCH" start ppid-live sleep 9999
+wait_socket ppid-live
+PPID_SOCK="$HOME/.cache/atch/ppid-live"
+# Write a PID that is definitely not an ancestor (PID 1 is init/launchd,
+# which is NOT a direct ancestor of our test shell in a normal session).
+# Using a large unlikely-to-exist PID is fragile; using PID 1 is safe because
+# PID 1 is the root, not our direct ancestor in the process hierarchy
+# (our shell's ppid is the test runner, not init).
+# Actually we need a PID that is NOT in our ancestry. PID of a sleep process works.
+DEAD_PID_PROC=$(sh -c 'sleep 60 & echo $!')
+sleep 0.05
+kill "$DEAD_PID_PROC" 2>/dev/null
+wait "$DEAD_PID_PROC" 2>/dev/null
+# DEAD_PID_PROC is now dead — write it as ppid
+printf "%d\n" "$DEAD_PID_PROC" > "${PPID_SOCK}.ppid"
+run env ATCH_SESSION="$PPID_SOCK" "$ATCH" attach ppid-live 2>&1
+assert_exit "ppid-guard: dead ppid → exit 1 (not self-attach)" 1 "$rc"
+assert_not_contains "ppid-guard: dead ppid → no self-attach msg" \
+    "from within itself" "$out"
+tidy ppid-live
+
+# Case C: .ppid file contains the PID of our current shell → guard MUST fire
+"$ATCH" start self-session sleep 9999
+wait_socket self-session
+SELF_SOCK="$HOME/.cache/atch/self-session"
+# Write the PID of the current shell ($$) as if this process IS the shell
+# running inside the session.  From atch's perspective, our process IS a
+# descendant of "$$" (itself) — so the guard should trigger.
+printf "%d\n" "$$" > "${SELF_SOCK}.ppid"
+run env ATCH_SESSION="$SELF_SOCK" "$ATCH" attach self-session 2>&1
+assert_exit "ppid-guard: self as ppid → blocked exit 1" 1 "$rc"
+assert_contains "ppid-guard: self as ppid → self-attach msg" \
+    "from within itself" "$out"
+tidy self-session
+
 # ── 22. no-args → usage ──────────────────────────────────────────────────────
 
 # Invoking with zero arguments calls usage() (exits 0, prints help).
@@ -719,6 +860,337 @@ assert_contains "no args: shows Usage:"              "Usage:" "$out"
 # tail command appears in help
 run "$ATCH" --help
 assert_contains "help: shows tail command"           "tail" "$out"
+
+# ── 22. start-inside-session: no [attached] when started from inside a session ──
+#
+# Regression test for: a session created with `atch start` from within an
+# attached session must never appear as [attached] in `atch list`.
+#
+# Root cause: create_socket restored the original umask BEFORE calling bind(2).
+# With a typical shell umask of 022, bind created the socket file with mode
+# 0755 (S_IXUSR set).  chmod(0600) was called immediately after, but the
+# tiny window between bind and chmod was enough for a concurrent `atch list`
+# (or an immediate stat after start) to see the stale execute bit and report
+# the session as [attached].
+#
+# Fix: use umask(0177) before bind so the socket is created directly as 0600
+# (no execute bit ever present during creation).
+#
+# Test strategy:
+#   A. Start outer-session so there is an [attached] session in the directory.
+#   B. Simulate being inside outer-session by setting ATCH_SESSION.
+#   C. Run `atch start inner-session` — no client must ever attach.
+#   D. Check socket mode immediately: S_IXUSR must NOT be set.
+#   E. Check `atch list`: inner-session must NOT show [attached].
+
+"$ATCH" start sis-outer sleep 999
+wait_socket sis-outer
+SIS_OUTER_SOCK="$HOME/.cache/atch/sis-outer"
+
+# Attach to outer via python so it shows [attached] — this mirrors the real
+# scenario where the user is inside the outer session.
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$SIS_OUTER_SOCK" << 'PYEOF' &
+import socket, struct, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall(struct.pack('BB8s', 1, 0, b'\x00' * 8))  # MSG_ATTACH
+time.sleep(15)
+s.close()
+PYEOF
+    SIS_ATTACH_PID=$!
+    sleep 0.1
+
+    # Start inner-session as if we are inside outer-session (ATCH_SESSION set)
+    ATCH_SESSION="$SIS_OUTER_SOCK" "$ATCH" start sis-inner sleep 999
+    wait_socket sis-inner
+    SIS_INNER_SOCK="$HOME/.cache/atch/sis-inner"
+
+    # Check socket mode immediately after start: no S_IXUSR allowed.
+    # The owner execute bit (S_IXUSR) is the bit 0 of the hundreds digit
+    # in the 3-digit octal representation (i.e., digit is 1, 3, 5, or 7).
+    # We extract the hundreds digit and test whether it is odd.
+    SOCK_MODE=$(stat -c "%a" "$SIS_INNER_SOCK" 2>/dev/null || \
+                stat -f "%Lp" "$SIS_INNER_SOCK" 2>/dev/null || echo "unknown")
+    # Hundreds digit: remove last two chars → first char of 3-digit mode
+    OWNER_DIGIT="${SOCK_MODE%??}"
+    case "$OWNER_DIGIT" in
+        1|3|5|7)
+            fail "start-inside: socket mode must not have S_IXUSR" \
+                 "owner digit 0,2,4 or 6 (no execute)" "$OWNER_DIGIT (mode $SOCK_MODE)" ;;
+        *)
+            ok "start-inside: socket created without S_IXUSR (mode $SOCK_MODE)" ;;
+    esac
+
+    # Check list: inner-session must NOT appear as [attached]
+    run "$ATCH" list
+    assert_not_contains \
+        "start-inside: inner session not shown as [attached] in list" \
+        "[attached]" \
+        "$(echo "$out" | grep sis-inner)"
+
+    kill $SIS_ATTACH_PID 2>/dev/null
+    wait $SIS_ATTACH_PID 2>/dev/null
+
+    tidy sis-outer
+    tidy sis-inner
+else
+    ok "start-inside: skip (python3 not available)"
+    ok "start-inside: skip (python3 not available)"
+fi
+
+# ── 23. detach-status: S_IXUSR cleared immediately after MSG_DETACH ──────────
+#
+# Regression test for: when the client detaches (Ctrl+\), it must send
+# MSG_DETACH to the master BEFORE calling exit(0).  This ensures the master
+# clears the S_IXUSR bit on the socket synchronously (within one select cycle)
+# so that `atch list` never races with a stale "[attached]" status.
+#
+# Without the fix, the client exits without MSG_DETACH; the master only learns
+# about the detach when it receives EOF on the closed fd, which can arrive after
+# a `list` reads the stale S_IXUSR bit — especially on loaded systems.
+#
+# Strategy: use Python to simulate the two scenarios:
+#   A. MSG_DETACH sent before close  → socket must lose S_IXUSR immediately
+#   B. Close without MSG_DETACH      → socket loses S_IXUSR after one master
+#                                       select cycle (tolerated, but slower)
+#
+# The critical invariant tested here is scenario A: after MSG_DETACH is sent
+# and acknowledged, `list` must NOT show "[attached]".  This is the exact
+# behaviour enforced by the fix in process_kbd.
+
+if command -v python3 >/dev/null 2>&1; then
+
+    # Helper: send MSG_ATTACH, optionally MSG_DETACH, then close.
+    # Usage: attach_and_detach <sock_path> <send_detach: 0|1>
+    attach_and_detach() {
+        python3 - "$1" "$2" << 'PYEOF'
+import socket, struct, sys, time
+
+sock_path = sys.argv[1]
+send_detach = sys.argv[2] == '1'
+
+MSG_ATTACH = 1
+MSG_DETACH = 2
+
+def pkt(msg_type):
+    return struct.pack('BB8s', msg_type, 0, b'\x00' * 8)
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+s.sendall(pkt(MSG_ATTACH))
+time.sleep(0.05)   # let master process MSG_ATTACH and set S_IXUSR
+if send_detach:
+    s.sendall(pkt(MSG_DETACH))
+    time.sleep(0.05)  # let master process MSG_DETACH and clear S_IXUSR
+s.close()
+PYEOF
+    }
+
+    # --- single session: proper MSG_DETACH flow (scenario A) ---
+    "$ATCH" start det-s1 sleep 999
+    wait_socket det-s1
+    SOCK1="$HOME/.cache/atch/det-s1"
+
+    attach_and_detach "$SOCK1" 1   # send MSG_DETACH before close
+    sleep 0.05                     # minimal delay after close
+
+    run "$ATCH" list
+    assert_not_contains \
+        "detach-status: session not shown as attached after MSG_DETACH" \
+        "[attached]" "$out"
+
+    tidy det-s1
+
+    # --- two sessions: reproduce the multi-session attach/detach cycle ---
+    # Steps mirror the exact reproduction sequence from the bug report:
+    #   create s1, detach, create s2, detach,
+    #   attach s1, detach, attach s2, detach → none should show [attached]
+    "$ATCH" start det-a sleep 999
+    "$ATCH" start det-b sleep 999
+    wait_socket det-a
+    wait_socket det-b
+    SOCKA="$HOME/.cache/atch/det-a"
+    SOCKB="$HOME/.cache/atch/det-b"
+
+    attach_and_detach "$SOCKA" 1
+    sleep 0.05
+    attach_and_detach "$SOCKB" 1
+    sleep 0.05
+    attach_and_detach "$SOCKA" 1
+    sleep 0.05
+
+    run "$ATCH" list
+    assert_not_contains \
+        "detach-status: det-a not [attached] after second detach cycle" \
+        "[attached]" "$out"
+
+    attach_and_detach "$SOCKB" 1
+    sleep 0.05
+
+    run "$ATCH" list
+    assert_not_contains \
+        "detach-status: det-b not [attached] after detach cycle" \
+        "[attached]" "$out"
+
+    tidy det-a
+    tidy det-b
+
+else
+    ok "detach-status: skip (python3 not available)"
+    ok "detach-status: skip (python3 not available)"
+    ok "detach-status: skip (python3 not available)"
+fi
+
+# ── 23. fault injection: short socket writes are retried ───────────────────
+# Force the first packet write to a socket to complete with 1 byte.
+# Verifies write_all() retries correctly instead of treating short writes
+# as fatal.
+
+TESTS_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+OS_NAME=$(uname -s)
+
+FAULT_LIB=
+build_short_write_injector() {
+    [ -n "$FAULT_LIB" ] && return 0
+    case "$OS_NAME" in
+        Darwin)
+            FAULT_LIB="$TESTDIR/libshortwrite.dylib"
+            cc -dynamiclib -O2 -Wall -o "$FAULT_LIB" \
+                "$TESTS_DIR/preload_short_write.c" >/dev/null 2>&1 ;;
+        *)
+            FAULT_LIB="$TESTDIR/libshortwrite.so"
+            cc -shared -fPIC -O2 -Wall -o "$FAULT_LIB" \
+                "$TESTS_DIR/preload_short_write.c" -ldl >/dev/null 2>&1 ;;
+    esac
+}
+
+with_short_socket_write() {
+    build_short_write_injector || return 1
+    case "$OS_NAME" in
+        Darwin)
+            env DYLD_INSERT_LIBRARIES="$FAULT_LIB" \
+                DYLD_FORCE_FLAT_NAMESPACE=1 \
+                ATCH_FAULT_SHORT_WRITE_ONCE=1 "$@" ;;
+        *)
+            env LD_PRELOAD="$FAULT_LIB" \
+                ATCH_FAULT_SHORT_WRITE_ONCE=1 "$@" ;;
+    esac
+}
+
+"$ATCH" start short-push sh -c 'cat'
+wait_socket short-push
+out=$(printf 'short-write-marker\n' | with_short_socket_write \
+    "$ATCH" push short-push 2>&1)
+prc=$?
+assert_exit "fault: push retries short socket write" 0 "$prc"
+sleep 0.2
+assert_contains "fault: push data reaches session after short write" \
+    "short-write-marker" "$(cat "$HOME/.cache/atch/short-push.log" 2>/dev/null)"
+tidy short-push
+
+"$ATCH" start short-kill sleep 999
+wait_socket short-kill
+out=$(with_short_socket_write "$ATCH" kill short-kill 2>&1)
+krc=$?
+assert_exit "fault: kill retries short socket write" 0 "$krc"
+run "$ATCH" list
+assert_not_contains "fault: session is gone after short-write kill" \
+    "short-kill" "$out"
+"$ATCH" kill -f short-kill >/dev/null 2>&1 || true
+
+# ── 24. signal safety (forkpty harness) ────────────────────────────────────
+# Builds and runs a C test binary that uses forkpty() to send signals
+# to the exact atch attach PID. Skips gracefully if cc is unavailable.
+
+TESTS_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+SIGNAL_HARNESS="$TESTDIR/test_signal"
+
+if cc -o "$SIGNAL_HARNESS" "$TESTS_DIR/test_signal.c" -lutil 2>/dev/null; then
+    "$ATCH" start sig-harness sleep 9999
+    wait_socket sig-harness
+
+    sig_out=$("$SIGNAL_HARNESS" "$ATCH" sig-harness 2>&1)
+
+    # Fold harness results into main TAP stream (avoid subshell pipe)
+    sig_tmpfile="$TESTDIR/sig_out.txt"
+    echo "$sig_out" > "$sig_tmpfile"
+    while IFS= read -r line; do
+        case "$line" in
+            ok\ *)
+                desc=$(echo "$line" | sed 's/^ok [0-9]* - //')
+                ok "signal: $desc"
+                ;;
+            not\ ok\ *)
+                desc=$(echo "$line" | sed 's/^not ok [0-9]* - //')
+                fail "signal: $desc"
+                ;;
+            "#"*)
+                printf "%s\n" "$line"
+                ;;
+        esac
+    done < "$sig_tmpfile"
+
+    tidy sig-harness
+else
+    ok "signal: SKIP — cc not available, cannot build forkpty harness"
+fi
+
+# ── 25. fd leak: rapid session cycling under low fd limit ──────────────────
+# openpty fallback leaks fds on error paths. Under a tight fd limit,
+# leaked fds accumulate and eventually prevent new sessions from starting.
+
+(
+    ulimit -n 64 2>/dev/null || true
+    LEAK_FAIL=0
+    i=0
+    while [ $i -lt 50 ]; do
+        out=$("$ATCH" start "leak-$i" sleep 999 2>&1)
+        lrc=$?
+        if [ "$lrc" -ne 0 ]; then
+            LEAK_FAIL=1
+            break
+        fi
+        "$ATCH" kill "leak-$i" >/dev/null 2>&1
+        sleep 0.02
+        i=$((i + 1))
+    done
+    i=0; while [ $i -lt 50 ]; do "$ATCH" kill "leak-$i" >/dev/null 2>&1; i=$((i + 1)); done
+    exit $LEAK_FAIL
+)
+if [ $? -eq 0 ]; then
+    ok "fd-leak: 50 create/destroy cycles under ulimit -n 64"
+else
+    fail "fd-leak: session failed under low fd limit (possible fd leak)" "50 cycles" "failed early"
+fi
+
+# ── 26. cwd preserved after socket failure ─────────────────────────────────
+# socket_with_chdir must restore cwd even when the socket operation fails.
+# We create the parent dir so chdir succeeds, but the session path is bogus.
+
+ORIG_PWD=$(pwd)
+mkdir -p "$TESTDIR/sockdir"
+"$ATCH" kill "$TESTDIR/sockdir/bogus" >/dev/null 2>&1
+AFTER_PWD=$(pwd)
+if [ "$ORIG_PWD" = "$AFTER_PWD" ]; then
+    ok "cwd: preserved after failed socket operation"
+else
+    fail "cwd: preserved after failed socket operation" "$ORIG_PWD" "$AFTER_PWD"
+    cd "$ORIG_PWD"
+fi
+
+# ── 24. strict attach does not replay log for dead sessions ────────────────
+# atch attach <session> must not dump the log when the session has exited.
+# Use 'atch tail' to view logs explicitly.
+
+rm -f "$HOME/.cache/atch"/*.log 2>/dev/null || true
+"$ATCH" start ghost sh -c 'printf "ghost-marker\n"; exit 0'
+sleep 0.3
+
+run "$ATCH" attach ghost
+assert_exit "ghost: strict attach to exited session → exit 1" 1 "$rc"
+assert_not_contains "ghost: attach does not replay log" "ghost-marker" "$out"
+rm -f "$HOME/.cache/atch/ghost.log"
 
 # ── summary ──────────────────────────────────────────────────────────────────
 

@@ -22,6 +22,8 @@
 #ifndef SCROLLBACK_SIZE
 #define SCROLLBACK_SIZE (128 * 1024)
 #endif
+_Static_assert(SCROLLBACK_SIZE > 0 && (SCROLLBACK_SIZE & (SCROLLBACK_SIZE - 1)) == 0,
+	"SCROLLBACK_SIZE must be a positive power of two");
 
 /* Maximum size of the on-disk session log; older bytes are trimmed on open */
 #ifndef LOG_MAX_SIZE
