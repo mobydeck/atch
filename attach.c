@@ -373,7 +373,7 @@ int attach_main(int noerror)
 	 ** the separator: the log ends at the exact pty cursor position, so
 	 ** the prompt is already visible and correctly placed. */
 	if (clear_method == CLEAR_MOVE && !no_ansiterm) {
-		write_buf_or_fail(1, "\033c", 2);
+		write_buf_or_fail(1, "\033[H\033[2J\033[3J", 14);
 	} else if (!quiet && !skip_ring) {
 		write_buf_or_fail(1, "\r\n", 2);
 	}
