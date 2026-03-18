@@ -203,6 +203,8 @@ static void process_kbd(int s, struct packet *pkt)
 	else if (pkt->u.buf[0] == detach_char) {
 		char age[32];
 		session_age(age, sizeof(age));
+		pkt->type = MSG_DETACH;
+		write_packet_or_fail(s, pkt);
 		printf("%s[%s: session '%s' detached after %s]\r\n",
 		       clear_csi_data(), progname, session_shortname(), age);
 		exit(0);
@@ -239,6 +241,10 @@ int replay_session_log(int saved_errno)
 	{
 		unsigned char rbuf[BUFSIZE];
 		ssize_t n;
+		struct stat st;
+
+		if (fstat(logfd, &st) == 0 && st.st_size > SCROLLBACK_SIZE)
+			lseek(logfd, st.st_size - SCROLLBACK_SIZE, SEEK_SET);
 
 		while ((n = read(logfd, rbuf, sizeof(rbuf))) > 0)
 			write(1, rbuf, (size_t)n);
@@ -263,10 +269,40 @@ int attach_main(int noerror)
 	fd_set readfds;
 	int s;
 
+	/* Attempt to open the socket. Don't display an error if noerror is
+	 ** set. */
+	s = connect_socket(sockname);
+	if (s < 0) {
+		int saved_errno = errno;
+		const char *name = session_shortname();
+
+		if (!noerror) {
+			if (saved_errno == ENOENT) {
+				printf
+				    ("%s: session '%s' does not exist\n",
+				     progname, name);
+			} else if (!replay_session_log(saved_errno)) {
+				if (saved_errno == ECONNREFUSED)
+					printf
+					    ("%s: session '%s' is not running\n",
+					     progname, name);
+				else if (saved_errno == ENOTSOCK)
+					printf
+					    ("%s: '%s' is not a valid session\n",
+					     progname, name);
+				else
+					printf("%s: %s: %s\n", progname,
+					       sockname, strerror(saved_errno));
+			}
+		}
+		return 1;
+	}
+
 	/* Refuse to attach to any session in our ancestry chain (catches both
 	 * direct self-attach and indirect loops like A -> B -> A).
 	 * SESSION_ENVVAR is the colon-separated chain, so scanning it covers
-	 * all ancestors. */
+	 * all ancestors.  The check is done after connect so that a stale env
+	 * var from a dead session does not block new attaches. */
 	{
 		const char *tosearch = getenv(SESSION_ENVVAR);
 
@@ -281,6 +317,7 @@ int attach_main(int noerror)
 
 				if (tlen == slen
 				    && strncmp(p, sockname, tlen) == 0) {
+					close(s);
 					if (!noerror)
 						printf
 						    ("%s: cannot attach to session '%s' from within itself\n",
@@ -293,35 +330,6 @@ int attach_main(int noerror)
 				p = colon + 1;
 			}
 		}
-	}
-
-	/* Attempt to open the socket. Don't display an error if noerror is
-	 ** set. */
-	s = connect_socket(sockname);
-	if (s < 0) {
-		int saved_errno = errno;
-		const char *name = session_shortname();
-
-		if (!noerror) {
-			if (!replay_session_log(saved_errno)) {
-				if (saved_errno == ENOENT)
-					printf
-					    ("%s: session '%s' does not exist\n",
-					     progname, name);
-				else if (saved_errno == ECONNREFUSED)
-					printf
-					    ("%s: session '%s' is not running\n",
-					     progname, name);
-				else if (saved_errno == ENOTSOCK)
-					printf
-					    ("%s: '%s' is not a valid session\n",
-					     progname, name);
-				else
-					printf("%s: %s: %s\n", progname,
-					       sockname, strerror(saved_errno));
-			}
-		}
-		return 1;
 	}
 
 	/* Replay the on-disk log so the user sees full session history.
