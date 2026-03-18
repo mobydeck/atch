@@ -1,0 +1,22 @@
+pkgname=atch
+pkgver=0.4
+pkgrel=1
+pkgdesc='Attach and detach terminal sessions — transparent, no terminal emulation'
+arch=('x86_64' 'aarch64')
+url='https://github.com/mobydeck/atch'
+license=('GPL-2.0-only')
+depends=('glibc')
+makedepends=('gcc' 'pandoc')
+source=("${url}/archive/${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  make STATIC_FLAG= VERSION="$pkgver"
+  make man
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  make install DESTDIR="$pkgdir" VERSION="$pkgver"
+}
