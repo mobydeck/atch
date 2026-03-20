@@ -248,28 +248,34 @@ static int create_socket(char *name)
 
 	omask = umask(077);
 	s = socket(PF_UNIX, SOCK_STREAM, 0);
-	umask(omask);		/* umask always succeeds, errno is untouched. */
-	if (s < 0)
+	if (s < 0) {
+		umask(omask);
 		return -1;
+	}
 	sockun.sun_family = AF_UNIX;
 	memcpy(sockun.sun_path, name, strlen(name) + 1);
 	if (bind(s, (struct sockaddr *)&sockun, sizeof(sockun)) < 0) {
 		close(s);
+		umask(omask);
 		return -1;
 	}
 	if (listen(s, 128) < 0) {
 		close(s);
+		umask(omask);
 		return -1;
 	}
 	if (setnonblocking(s) < 0) {
 		close(s);
+		umask(omask);
 		return -1;
 	}
 	/* chmod it to prevent any surprises */
 	if (chmod(name, 0600) < 0) {
 		close(s);
+		umask(omask);
 		return -1;
 	}
+	umask(omask);
 	return s;
 }
 
