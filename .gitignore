@@ -7,3 +7,5 @@
 /atch
 build/
 release/
+*.deb
+*.pkg.tar.*

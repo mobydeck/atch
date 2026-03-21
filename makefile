@@ -31,6 +31,14 @@ atch.1: atch.1.md
 
 man: atch.1
 
+PREFIX ?= /usr
+MANDIR ?= $(PREFIX)/share/man
+
+.PHONY: install
+install: atch
+	install -Dm755 $(BUILDDIR)/atch $(DESTDIR)$(PREFIX)/bin/atch
+	if [ -f atch.1 ]; then install -Dm644 atch.1 $(DESTDIR)$(MANDIR)/man1/atch.1; fi
+
 clean:
 	rm -f atch $(OBJ) *.1.md *.c~
 
