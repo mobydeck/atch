@@ -802,29 +802,29 @@ int
 openpty(int *amaster, int *aslave, char *name, struct termios *termp,
 	struct winsize *winp)
 {
-	int master, slave;
+	int master = -1, slave = -1;
 	char *buf;
 
 	master = open("/dev/ptmx", O_RDWR);
 	if (master < 0)
 		return -1;
 	if (grantpt(master) < 0)
-		return -1;
+		goto fail;
 	if (unlockpt(master) < 0)
-		return -1;
+		goto fail;
 	buf = ptsname(master);
 	if (!buf)
-		return -1;
+		goto fail;
 
 	slave = open(buf, O_RDWR | O_NOCTTY);
 	if (slave < 0)
-		return -1;
+		goto fail;
 
 #ifdef I_PUSH
 	if (ioctl(slave, I_PUSH, "ptem") < 0)
-		return -1;
+		goto fail;
 	if (ioctl(slave, I_PUSH, "ldterm") < 0)
-		return -1;
+		goto fail;
 #endif
 
 	*amaster = master;
@@ -836,6 +836,13 @@ openpty(int *amaster, int *aslave, char *name, struct termios *termp,
 	if (winp)
 		ioctl(slave, TIOCSWINSZ, winp);
 	return 0;
+
+fail:
+	if (master >= 0)
+		close(master);
+	if (slave >= 0)
+		close(slave);
+	return -1;
 }
 
 pid_t

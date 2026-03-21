@@ -115,6 +115,8 @@ struct packet
 		struct winsize ws;
 	} u;
 };
+_Static_assert(sizeof(((struct packet *)0)->u.buf) <= 255,
+	"packet buffer must fit in uint8_t length");
 
 /*
 ** The master sends a simple stream of text to the attaching clients, without
