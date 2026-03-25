@@ -815,6 +815,100 @@ run "$ATCH" --help
 assert_contains "help: shows tail command"           "tail" "$out"
 assert_contains "help: shows rm command"             "rm" "$out"
 
+# ── 23. fault injection: short socket writes are retried ───────────────────
+# Force the first packet write to a socket to complete with 1 byte.
+# Verifies write_all() retries correctly instead of treating short writes
+# as fatal.
+
+TESTS_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+OS_NAME=$(uname -s)
+
+FAULT_LIB=
+build_short_write_injector() {
+    [ -n "$FAULT_LIB" ] && return 0
+    case "$OS_NAME" in
+        Darwin)
+            FAULT_LIB="$TESTDIR/libshortwrite.dylib"
+            cc -dynamiclib -O2 -Wall -o "$FAULT_LIB" \
+                "$TESTS_DIR/preload_short_write.c" >/dev/null 2>&1 ;;
+        *)
+            FAULT_LIB="$TESTDIR/libshortwrite.so"
+            cc -shared -fPIC -O2 -Wall -o "$FAULT_LIB" \
+                "$TESTS_DIR/preload_short_write.c" -ldl >/dev/null 2>&1 ;;
+    esac
+}
+
+with_short_socket_write() {
+    build_short_write_injector || return 1
+    case "$OS_NAME" in
+        Darwin)
+            env DYLD_INSERT_LIBRARIES="$FAULT_LIB" \
+                DYLD_FORCE_FLAT_NAMESPACE=1 \
+                ATCH_FAULT_SHORT_WRITE_ONCE=1 "$@" ;;
+        *)
+            env LD_PRELOAD="$FAULT_LIB" \
+                ATCH_FAULT_SHORT_WRITE_ONCE=1 "$@" ;;
+    esac
+}
+
+"$ATCH" start short-push sh -c 'cat'
+wait_socket short-push
+out=$(printf 'short-write-marker\n' | with_short_socket_write \
+    "$ATCH" push short-push 2>&1)
+prc=$?
+assert_exit "fault: push retries short socket write" 0 "$prc"
+sleep 0.2
+assert_contains "fault: push data reaches session after short write" \
+    "short-write-marker" "$(cat "$HOME/.cache/atch/short-push.log" 2>/dev/null)"
+tidy short-push
+
+"$ATCH" start short-kill sleep 999
+wait_socket short-kill
+out=$(with_short_socket_write "$ATCH" kill short-kill 2>&1)
+krc=$?
+assert_exit "fault: kill retries short socket write" 0 "$krc"
+run "$ATCH" list
+assert_not_contains "fault: session is gone after short-write kill" \
+    "short-kill" "$out"
+"$ATCH" kill -f short-kill >/dev/null 2>&1 || true
+
+# ── 24. signal safety (forkpty harness) ────────────────────────────────────
+# Builds and runs a C test binary that uses forkpty() to send signals
+# to the exact atch attach PID. Skips gracefully if cc is unavailable.
+
+TESTS_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+SIGNAL_HARNESS="$TESTDIR/test_signal"
+
+if cc -o "$SIGNAL_HARNESS" "$TESTS_DIR/test_signal.c" -lutil 2>/dev/null; then
+    "$ATCH" start sig-harness sleep 9999
+    wait_socket sig-harness
+
+    sig_out=$("$SIGNAL_HARNESS" "$ATCH" sig-harness 2>&1)
+
+    # Fold harness results into main TAP stream (avoid subshell pipe)
+    sig_tmpfile="$TESTDIR/sig_out.txt"
+    echo "$sig_out" > "$sig_tmpfile"
+    while IFS= read -r line; do
+        case "$line" in
+            ok\ *)
+                desc=$(echo "$line" | sed 's/^ok [0-9]* - //')
+                ok "signal: $desc"
+                ;;
+            not\ ok\ *)
+                desc=$(echo "$line" | sed 's/^not ok [0-9]* - //')
+                fail "signal: $desc"
+                ;;
+            "#"*)
+                printf "%s\n" "$line"
+                ;;
+        esac
+    done < "$sig_tmpfile"
+
+    tidy sig-harness
+else
+    ok "signal: SKIP — cc not available, cannot build forkpty harness"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 
 printf "\n1..%d\n" "$T"

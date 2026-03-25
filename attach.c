@@ -14,7 +14,9 @@
 */
 static struct termios cur_term;
 /* 1 if the window size changed */
-static int win_changed;
+static volatile sig_atomic_t win_changed;
+/* Non-zero if a fatal signal was received; stores the signal number. */
+static volatile sig_atomic_t die_signal;
 /* Socket creation time, used to compute session age in messages. */
 time_t session_start;
 
@@ -27,58 +29,90 @@ char const *clear_csi_data(void)
 	return "\033[999H\r\n";
 }
 
-/* Write buf to fd handling partial writes. Exit on failure. */
-void write_buf_or_fail(int fd, const void *buf, size_t count)
+/* Exit promptly once the main thread notices a fatal signal.
+ * If terminal output itself is wedged, skip stdio entirely. */
+static void exit_for_deferred_signal(int can_print)
+{
+	int sig = die_signal;
+	char age[32];
+
+	if (!sig)
+		return;
+	if (!can_print) {
+		tcsetattr(0, TCSANOW, &orig_term);
+		_exit(1);
+	}
+	session_age(age, sizeof(age));
+	if (sig == SIGHUP || sig == SIGINT)
+		printf("%s[%s: session '%s' detached after %s]\r\n",
+		       clear_csi_data(), progname, session_shortname(), age);
+	else
+		printf("%s[%s: session '%s' got signal %d - exiting after %s]\r\n",
+		       clear_csi_data(), progname, session_shortname(), sig, age);
+	exit(1);
+}
+
+/* Write all of buf to fd, retrying on short writes and EINTR.
+** Returns 0 on success, -1 on failure (errno is set). */
+static int write_all(int fd, const void *buf, size_t count)
 {
 	while (count != 0) {
 		ssize_t ret = write(fd, buf, count);
 
-		if (ret >= 0) {
+		if (ret > 0) {
 			buf = (const char *)buf + ret;
 			count -= ret;
-		} else if (ret < 0 && errno == EINTR)
+		} else if (ret < 0 && errno == EINTR) {
+			if (die_signal)
+				return -1;
 			continue;
-		else {
-			if (session_start) {
-				char age[32];
-				session_age(age, sizeof(age));
-				printf
-				    ("%s[%s: session '%s' write failed after %s]\r\n",
-				     clear_csi_data(), progname,
-				     session_shortname(), age);
-			} else {
-				printf("%s[%s: write failed]\r\n",
-				       clear_csi_data(), progname);
-			}
-			exit(1);
+		} else {
+			/* ret == 0 (no progress) or ret < 0 (real error) */
+			if (ret == 0)
+				errno = EIO;
+			return -1;
 		}
+	}
+	return 0;
+}
+
+/* Write buf to fd handling partial writes. Exit on failure. */
+void write_buf_or_fail(int fd, const void *buf, size_t count)
+{
+	if (write_all(fd, buf, count) < 0) {
+		exit_for_deferred_signal(fd != 1);
+		if (session_start) {
+			char age[32];
+			session_age(age, sizeof(age));
+			printf
+			    ("%s[%s: session '%s' write failed after %s]\r\n",
+			     clear_csi_data(), progname,
+			     session_shortname(), age);
+		} else {
+			printf("%s[%s: write failed]\r\n",
+			       clear_csi_data(), progname);
+		}
+		exit(1);
 	}
 }
 
 /* Write pkt to fd. Exit on failure. */
 void write_packet_or_fail(int fd, const struct packet *pkt)
 {
-	while (1) {
-		ssize_t ret = write(fd, pkt, sizeof(struct packet));
-
-		if (ret == sizeof(struct packet))
-			return;
-		else if (ret < 0 && errno == EINTR)
-			continue;
-		else {
-			if (session_start) {
-				char age[32];
-				session_age(age, sizeof(age));
-				printf
-				    ("%s[%s: session '%s' write failed after %s]\r\n",
-				     clear_csi_data(), progname,
-				     session_shortname(), age);
-			} else {
-				printf("%s[%s: write failed]\r\n",
-				       clear_csi_data(), progname);
-			}
-			exit(1);
+	if (write_all(fd, pkt, sizeof(struct packet)) < 0) {
+		exit_for_deferred_signal(fd != 1);
+		if (session_start) {
+			char age[32];
+			session_age(age, sizeof(age));
+			printf
+			    ("%s[%s: session '%s' write failed after %s]\r\n",
+			     clear_csi_data(), progname,
+			     session_shortname(), age);
+		} else {
+			printf("%s[%s: write failed]\r\n",
+			       clear_csi_data(), progname);
 		}
+		exit(1);
 	}
 }
 
@@ -149,26 +183,15 @@ void session_age(char *buf, size_t size)
 	format_age(now > session_start ? now - session_start : 0, buf, size);
 }
 
-/* Signal */
+/* Signal -- only set a flag; all non-trivial work happens in the main loop. */
 static RETSIGTYPE die(int sig)
 {
-	char age[32];
-	session_age(age, sizeof(age));
-	/* Print a nice pretty message for some things. */
-	if (sig == SIGHUP || sig == SIGINT)
-		printf("%s[%s: session '%s' detached after %s]\r\n",
-		       clear_csi_data(), progname, session_shortname(), age);
-	else
-		printf
-		    ("%s[%s: session '%s' got signal %d - exiting after %s]\r\n",
-		     clear_csi_data(), progname, session_shortname(), sig, age);
-	exit(1);
+	die_signal = sig;
 }
 
-/* Window size change. */
+/* Window size change -- only set a flag. */
 static RETSIGTYPE win_change(ATTRIBUTE_UNUSED int sig)
 {
-	signal(SIGWINCH, win_change);
 	win_changed = 1;
 }
 
@@ -344,14 +367,32 @@ int attach_main(int noerror)
 	/* Set a trap to restore the terminal when we die. */
 	atexit(restore_term);
 
-	/* Set some signals. */
-	signal(SIGPIPE, SIG_IGN);
-	signal(SIGXFSZ, SIG_IGN);
-	signal(SIGHUP, die);
-	signal(SIGTERM, die);
-	signal(SIGINT, die);
-	signal(SIGQUIT, die);
-	signal(SIGWINCH, win_change);
+	/* Set some signals using sigaction to avoid SA_RESTART ambiguity. */
+	{
+		struct sigaction sa_ign, sa_die, sa_winch;
+
+		memset(&sa_ign, 0, sizeof(sa_ign));
+		sa_ign.sa_handler = SIG_IGN;
+		sigemptyset(&sa_ign.sa_mask);
+		sigaction(SIGPIPE, &sa_ign, NULL);
+		sigaction(SIGXFSZ, &sa_ign, NULL);
+
+		memset(&sa_die, 0, sizeof(sa_die));
+		sa_die.sa_handler = die;
+		sigemptyset(&sa_die.sa_mask);
+		/* No SA_RESTART: let select() return EINTR so the loop
+		 * notices die_signal promptly. */
+		sigaction(SIGHUP, &sa_die, NULL);
+		sigaction(SIGTERM, &sa_die, NULL);
+		sigaction(SIGINT, &sa_die, NULL);
+		sigaction(SIGQUIT, &sa_die, NULL);
+
+		memset(&sa_winch, 0, sizeof(sa_winch));
+		sa_winch.sa_handler = win_change;
+		sigemptyset(&sa_winch.sa_mask);
+		sa_winch.sa_flags = SA_RESTART;  /* benign — don't interrupt I/O */
+		sigaction(SIGWINCH, &sa_winch, NULL);
+	}
 
 	/* Set raw mode. */
 	cur_term.c_iflag &=
@@ -396,10 +437,16 @@ int attach_main(int noerror)
 	while (1) {
 		int n;
 
+		exit_for_deferred_signal(1);
+
 		FD_ZERO(&readfds);
 		FD_SET(0, &readfds);
 		FD_SET(s, &readfds);
 		n = select(s + 1, &readfds, NULL, NULL, NULL);
+
+		/* Check for deferred fatal signal. */
+		exit_for_deferred_signal(1);
+
 		if (n < 0 && errno != EINTR && errno != EAGAIN) {
 			char age[32];
 			session_age(age, sizeof(age));
@@ -425,6 +472,8 @@ int attach_main(int noerror)
 				}
 				exit(0);
 			} else if (len < 0) {
+				if (errno == EINTR)
+					continue;
 				char age[32];
 				session_age(age, sizeof(age));
 				printf
@@ -445,6 +494,8 @@ int attach_main(int noerror)
 			memset(pkt.u.buf, 0, sizeof(pkt.u.buf));
 			len = read(0, pkt.u.buf, sizeof(pkt.u.buf));
 
+			if (len < 0 && errno == EINTR)
+				continue;
 			if (len <= 0)
 				exit(1);
 
@@ -497,11 +548,7 @@ int push_main()
 		}
 
 		pkt.len = len;
-		len = write(s, &pkt, sizeof(struct packet));
-		if (len != sizeof(struct packet)) {
-			if (len >= 0)
-				errno = EPIPE;
-
+		if (write_all(s, &pkt, sizeof(struct packet)) < 0) {
 			printf("%s: %s: %s\n", progname, sockname,
 			       strerror(errno));
 			return 1;
@@ -521,9 +568,9 @@ static int send_kill(int sig)
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.type = MSG_KILL;
 	pkt.len = (unsigned char)sig;
-	ret = write(s, &pkt, sizeof(pkt));
+	ret = write_all(s, &pkt, sizeof(pkt));
 	close(s);
-	return (ret == sizeof(pkt)) ? 0 : -1;
+	return ret;
 }
 
 static int session_gone(void)
