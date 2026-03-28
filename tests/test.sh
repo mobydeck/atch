@@ -815,6 +815,21 @@ run "$ATCH" --help
 assert_contains "help: shows tail command"           "tail" "$out"
 assert_contains "help: shows rm command"             "rm" "$out"
 
+# ── 23. cwd preserved after socket failure ─────────────────────────────────
+# socket_with_chdir must restore cwd even when the socket operation fails.
+# We create the parent dir so chdir succeeds, but the session path is bogus.
+
+ORIG_PWD=$(pwd)
+mkdir -p "$TESTDIR/sockdir"
+"$ATCH" kill "$TESTDIR/sockdir/bogus" >/dev/null 2>&1
+AFTER_PWD=$(pwd)
+if [ "$ORIG_PWD" = "$AFTER_PWD" ]; then
+    ok "cwd: preserved after failed socket operation"
+else
+    fail "cwd: preserved after failed socket operation" "$ORIG_PWD" "$AFTER_PWD"
+    cd "$ORIG_PWD"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 
 printf "\n1..%d\n" "$T"
