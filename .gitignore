@@ -7,3 +7,9 @@
 /atch
 build/
 release/
+debian/.debhelper/
+debian/*.debhelper.log
+debian/*.substvars
+debian/debhelper-build-stamp
+debian/files
+debian/atch/
