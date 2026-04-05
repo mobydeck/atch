@@ -307,7 +307,10 @@ static void save_term(void)
 	if (tcgetattr(0, &orig_term) < 0) {
 		memset(&orig_term, 0, sizeof(struct termios));
 		dont_have_tty = 1;
+		return;
 	}
+	if (!no_ansiterm)
+		init_terminfo();
 }
 
 /* Print error and return 1 if no tty is available. */

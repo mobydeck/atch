@@ -2,7 +2,7 @@ Source: atch
 Section: utils
 Priority: optional
 Maintainer: Matt <matt@localhost>
-Build-Depends: debhelper-compat (= 13), pandoc
+Build-Depends: debhelper-compat (= 13), pandoc, libtinfo-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/mattsawyer77/atch
 

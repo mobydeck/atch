@@ -144,6 +144,7 @@ int list_main(int show_all);
 int kill_main(int force);
 
 char const * clear_csi_data(void);
+void init_terminfo(void);
 
 #ifdef sun
 #define BROKEN_MASTER

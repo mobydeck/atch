@@ -2,7 +2,8 @@ VERSION ?= dev
 CC = gcc
 CFLAGS = -g -O2 -W -Wall -I. -DPACKAGE_VERSION=\"$(VERSION)\"
 LDFLAGS =
-LIBS = -lutil
+TERMINFO_LIB := $(shell echo 'int main(void){return 0;}' | $(CC) -static -ltinfo -o /dev/null -x c - 2>/dev/null && echo -ltinfo || echo -lcurses)
+LIBS = -lutil $(TERMINFO_LIB)
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
