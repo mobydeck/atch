@@ -374,8 +374,11 @@ int attach_main(int noerror)
 	 ** the prompt is already visible and correctly placed. */
 	if (clear_method == CLEAR_MOVE && !no_ansiterm) {
 		write_buf_or_fail(1, "\033c", 2);
-	} else if (!quiet && !skip_ring) {
-		write_buf_or_fail(1, "\r\n", 2);
+	} else {
+		if (!no_ansiterm)
+			write_buf_or_fail(1, "\033[?25h", 6);
+		if (!quiet && !skip_ring)
+			write_buf_or_fail(1, "\r\n", 2);
 	}
 
 	/* Tell the master that we want to attach.
