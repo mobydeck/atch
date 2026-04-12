@@ -266,6 +266,9 @@ int replay_session_log(int saved_errno)
 	int logfd;
 	const char *name;
 
+	if (!no_ansiterm)
+		tstate_replay_preamble(sockname);
+
 	snprintf(log_path, sizeof(log_path), "%s.log", sockname);
 	logfd = open(log_path, O_RDONLY);
 	if (logfd < 0)
@@ -507,6 +510,31 @@ int attach_main(int noerror)
 			write_packet_or_fail(s, &pkt);
 		}
 	}
+	return 0;
+}
+
+int push_bytes(const unsigned char *data, size_t datalen)
+{
+	struct packet pkt;
+	int s;
+
+	s = connect_socket(sockname);
+	if (s < 0)
+		return -1;
+	signal(SIGPIPE, SIG_IGN);
+	pkt.type = MSG_PUSH;
+	while (datalen > 0) {
+		size_t chunk = datalen > sizeof(pkt.u.buf) ? sizeof(pkt.u.buf) : datalen;
+		memcpy(pkt.u.buf, data, chunk);
+		pkt.len = chunk;
+		if (write(s, &pkt, sizeof(struct packet)) != sizeof(struct packet)) {
+			close(s);
+			return -1;
+		}
+		data += chunk;
+		datalen -= chunk;
+	}
+	close(s);
 	return 0;
 }
 

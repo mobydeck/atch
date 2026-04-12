@@ -8,8 +8,8 @@ DEB_VERSION = $(shell dpkg-parsechangelog -S Version | sed 's/~.*//')
 	dh $@
 
 override_dh_auto_build:
-	$(MAKE) attach.o master.o atch.o VERSION=$(DEB_VERSION)
-	$(CC) -o atch $(LDFLAGS) attach.o master.o atch.o -lutil -ltinfo
+	$(MAKE) attach.o master.o atch.o tstate.o VERSION=$(DEB_VERSION)
+	$(CC) -o atch $(LDFLAGS) attach.o master.o atch.o tstate.o -lutil -ltinfo
 	$(MAKE) man
 
 override_dh_auto_install:

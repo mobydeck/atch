@@ -12,8 +12,8 @@ else
   STATIC_FLAG = -static
 endif
 
-OBJ = attach.o master.o atch.o
-SRC = attach.c master.c atch.c
+OBJ = attach.o master.o atch.o tstate.o
+SRC = attach.c master.c atch.c tstate.c
 
 IMAGE = atch-builder
 BUILDDIR ?= .
@@ -47,6 +47,7 @@ fmt-all:
 attach.o: ./attach.c ./atch.h config.h
 master.o: ./master.c ./atch.h config.h
 atch.o: ./atch.c ./atch.h config.h
+tstate.o: ./tstate.c ./atch.h
 
 .PHONY: build-image
 build-image:

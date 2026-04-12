@@ -511,28 +511,31 @@ static int cmd_kill(int argc, char **argv)
 	return kill_main(force);
 }
 
+/* Helper: consume session name from args or fall back to ATCH_SESSION env. */
+static int consume_session_or_env(int *argc, char ***argv)
+{
+	if (*argc > 0)
+		return consume_session(argc, argv);
+
+	const char *chain = getenv(SESSION_ENVVAR);
+	const char *last;
+	if (!chain || !*chain) {
+		printf("%s: No session was specified.\n", progname);
+		return 1;
+	}
+	last = strrchr(chain, ':');
+	sockname = (char *)(last ? last + 1 : chain);
+	return 0;
+}
+
 /* atch clear <session> — truncate the on-disk session log */
 static int cmd_clear(int argc, char **argv)
 {
 	char log_path[600];
 	int fd;
 
-	if (argc > 0) {
-		if (consume_session(&argc, &argv))
-			return 1;
-	} else {
-		const char *chain = getenv(SESSION_ENVVAR);
-		const char *last;
-
-		if (!chain || !*chain) {
-			printf("%s: No session was specified.\n", progname);
-			printf("Try '%s --help' for more information.\n",
-			       progname);
-			return 1;
-		}
-		last = strrchr(chain, ':');
-		sockname = (char *)(last ? last + 1 : chain);
-	}
+	if (consume_session_or_env(&argc, &argv))
+		return 1;
 	if (argc > 0) {
 		printf("%s: Invalid number of arguments.\n", progname);
 		printf("Try '%s --help' for more information.\n", progname);
@@ -542,6 +545,7 @@ static int cmd_clear(int argc, char **argv)
 	fd = open(log_path, O_WRONLY | O_TRUNC);
 	if (fd >= 0) {
 		close(fd);
+		tstate_cleanup(sockname);
 		if (!quiet)
 			printf("%s: session '%s' log cleared\n",
 			       progname, session_shortname());
@@ -690,6 +694,196 @@ static int cmd_rm(int argc, char **argv)
 		return 1;
 	}
 	return rm_main(0);
+}
+
+static int cmd_tstate(int argc, char **argv)
+{
+	const char *subcmd;
+	int preamble_only = 0, push_only = 0, global = 0;
+
+	/* Parse flags before subcmd */
+	while (argc > 0 && argv[0][0] == '-' && argv[0][1] == '-') {
+		if (strcmp(argv[0], "--preamble-only") == 0)
+			preamble_only = 1;
+		else if (strcmp(argv[0], "--push-only") == 0)
+			push_only = 1;
+		else if (strcmp(argv[0], "--global") == 0)
+			global = 1;
+		else
+			break;
+		++argv; --argc;
+	}
+
+	/* Determine subcommand (default: show) */
+	subcmd = (argc > 0) ? argv[0] : "show";
+	if (argc > 0 && strcmp(subcmd, "show") != 0 &&
+	    strcmp(subcmd, "set") != 0 && strcmp(subcmd, "toggle") != 0 &&
+	    strcmp(subcmd, "reset") != 0 && strcmp(subcmd, "track") != 0 &&
+	    strcmp(subcmd, "notrack") != 0) {
+		subcmd = "show";
+	} else if (argc > 0) {
+		++argv; --argc;
+	}
+
+	if (strcmp(subcmd, "show") == 0) {
+		if (consume_session_or_env(&argc, &argv))
+			return 1;
+		tstate_show(sockname);
+		return 0;
+	}
+
+	if (strcmp(subcmd, "reset") == 0) {
+		if (consume_session_or_env(&argc, &argv))
+			return 1;
+		if (!push_only)
+			tstate_cleanup(sockname);
+		if (!preamble_only) {
+			unsigned char reset_buf[256];
+			int rlen;
+			tstate_load_global_config();
+			tstate_load_config(sockname);
+			rlen = tstate_reset_all(reset_buf, sizeof(reset_buf));
+			if (rlen > 0)
+				push_bytes(reset_buf, (size_t)rlen);
+		}
+		if (!quiet)
+			printf("%s: terminal state reset for '%s'\n",
+			       progname, session_shortname());
+		return 0;
+	}
+
+	if (strcmp(subcmd, "set") == 0 || strcmp(subcmd, "toggle") == 0) {
+		const char *mode_arg;
+		int mode, new_state = -1;
+		unsigned char seq_buf[32];
+		int seq_len;
+
+		if (argc < 1) {
+			printf("%s: tstate %s requires a mode\n",
+			       progname, subcmd);
+			return 1;
+		}
+		mode_arg = argv[0];
+		++argv; --argc;
+
+		mode = tstate_find_mode(mode_arg);
+		if (mode < 0) {
+			printf("%s: unknown mode '%s'\n",
+			       progname, mode_arg);
+			return 1;
+		}
+
+		if (strcmp(subcmd, "set") == 0) {
+			if (argc < 1) {
+				printf("%s: tstate set requires a value "
+				       "(h/l/on/off or tiname)\n", progname);
+				return 1;
+			}
+			new_state = tstate_resolve_state(mode, argv[0]);
+			if (new_state < 0) {
+				printf("%s: unknown value '%s'\n",
+				       progname, argv[0]);
+				return 1;
+			}
+			++argv; --argc;
+		}
+
+		if (consume_session_or_env(&argc, &argv))
+			return 1;
+
+		/* Load current state */
+		tstate_load_global_config();
+		tstate_load_config(sockname);
+
+		if (strcmp(subcmd, "toggle") == 0) {
+			tstate_toggle_mode(mode);
+		} else {
+			tstate_set_mode(mode, new_state);
+		}
+
+		if (!push_only)
+			tstate_write_preamble(sockname);
+
+		if (!preamble_only) {
+			int push_state = (strcmp(subcmd, "toggle") == 0)
+					 ? tstate_get_mode(mode) : new_state;
+			if (push_state >= 0) {
+				seq_len = tstate_mode_seq(mode, push_state,
+							  seq_buf, sizeof(seq_buf));
+				if (seq_len > 0)
+					push_bytes(seq_buf, (size_t)seq_len);
+			}
+		}
+		return 0;
+	}
+
+	if (strcmp(subcmd, "track") == 0 || strcmp(subcmd, "notrack") == 0) {
+		const char *mode_arg;
+		int mode;
+		int tracked = (strcmp(subcmd, "track") == 0) ? 1 : 0;
+		const char *name = NULL;
+
+		if (argc < 1) {
+			printf("%s: tstate %s requires a mode\n",
+			       progname, subcmd);
+			return 1;
+		}
+		mode_arg = argv[0];
+		++argv; --argc;
+
+		mode = tstate_find_mode(mode_arg);
+		if (mode < 0) {
+			printf("%s: unknown mode '%s'\n",
+			       progname, mode_arg);
+			return 1;
+		}
+
+		/* Optional name for new modes */
+		if (tracked && argc > 0 && argv[0][0] != '-') {
+			/* Check if this arg looks like a name (not a session path) */
+			if (!strchr(argv[0], '/')) {
+				name = argv[0];
+				++argv; --argc;
+			}
+		}
+
+		if (!global) {
+			if (consume_session_or_env(&argc, &argv))
+				return 1;
+		}
+
+		if (global)
+			tstate_load_global_config();
+		else {
+			tstate_load_global_config();
+			tstate_load_config(sockname);
+		}
+
+		if (tracked)
+			tstate_track_mode(mode, name);
+		else
+			tstate_notrack_mode(mode);
+
+		if (global)
+			tstate_save_global_config();
+		else
+			tstate_save_config(sockname);
+
+		if (!quiet) {
+			if (global)
+				printf("%s: %s mode %d globally\n", progname,
+				       tracked ? "tracking" : "not tracking",
+				       mode);
+			else
+				printf("%s: %s mode %d for '%s'\n", progname,
+				       tracked ? "tracking" : "not tracking",
+				       mode, session_shortname());
+		}
+		return 0;
+	}
+
+	printf("%s: unknown tstate command '%s'\n", progname, subcmd);
+	return 1;
 }
 
 /* Default: atch <session> [cmd...] — attach-or-create */
@@ -940,6 +1134,8 @@ int main(int argc, char **argv)
 		return cmd_tail(argc, argv);
 	if (is_cmd(cmd, "rm", NULL, NULL))
 		return cmd_rm(argc, argv);
+	if (is_cmd(cmd, "tstate", "ts", NULL))
+		return cmd_tstate(argc, argv);
 
 	/* Smart default: treat first arg as session name → attach-or-create */
 	return cmd_open((char *)cmd, argc, argv);
