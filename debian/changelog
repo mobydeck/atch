@@ -1,3 +1,10 @@
+atch (0.3b~local3) unstable; urgency=low
+
+  * Remove unconditional cnorm after log replay; tstate preamble handles
+    cursor visibility now.
+
+ -- Matt Keenan <github@mattkeenan.net>  Sat, 12 Apr 2026 00:00:00 +0000
+
 atch (0.3b~local2) unstable; urgency=low
 
   * Add DEC private mode state tracker for terminal state preservation.
