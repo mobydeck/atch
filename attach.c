@@ -416,12 +416,6 @@ int attach_main(int noerror)
 		else
 			write_buf_or_fail(1, "\033c", 2);
 	} else {
-		if (!no_ansiterm) {
-			if (ti_cnorm)
-				write_buf_or_fail(1, ti_cnorm, strlen(ti_cnorm));
-			else
-				write_buf_or_fail(1, "\033[?25h", 6);
-		}
 		if (!quiet && !skip_ring)
 			write_buf_or_fail(1, "\r\n", 2);
 	}
