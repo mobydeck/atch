@@ -1,4 +1,6 @@
 #include "atch.h"
+#include <curses.h>
+#include <term.h>
 
 #ifndef VDISABLE
 #ifdef _POSIX_VDISABLE
@@ -12,11 +14,34 @@
 ** The current terminal settings. After coming back from a suspend, we
 ** restore this.
 */
-static struct termios cur_term;
+static struct termios raw_term;
 /* 1 if the window size changed */
 static int win_changed;
 /* Socket creation time, used to compute session age in messages. */
 time_t session_start;
+
+/* Terminfo capability strings, NULL when unavailable or -t is set. */
+static const char *ti_sgr0;	/* reset attributes */
+static const char *ti_cnorm;	/* show cursor (normal) */
+static const char *ti_rs2;	/* full reset */
+static const char *ti_cup;	/* cursor_address (parametric) */
+
+static const char *ti_get(const char *cap)
+{
+	const char *s = tigetstr(cap);
+	return (s && s != (char *)-1) ? s : NULL;
+}
+
+void init_terminfo(void)
+{
+	int err;
+	if (setupterm(NULL, 1, &err) != OK)
+		return;
+	ti_sgr0  = ti_get("sgr0");
+	ti_cnorm = ti_get("cnorm");
+	ti_rs2   = ti_get("rs2");
+	ti_cup   = ti_get("cup");
+}
 
 char const *clear_csi_data(void)
 {
@@ -24,6 +49,11 @@ char const *clear_csi_data(void)
 	    (clear_method == CLEAR_UNSPEC && dont_have_tty))
 		return "\r\n";
 	/* CLEAR_MOVE, or CLEAR_UNSPEC with a real tty: move to bottom */
+	if (ti_cup) {
+		static char buf[64];
+		snprintf(buf, sizeof(buf), "%s\r\n", tparm(ti_cup, 999, 0));
+		return buf;
+	}
 	return "\033[999H\r\n";
 }
 
@@ -87,7 +117,12 @@ static void restore_term(void)
 {
 	tcsetattr(0, TCSADRAIN, &orig_term);
 	if (!no_ansiterm) {
-		printf("\033[0m\033[?25h");
+		if (ti_sgr0)
+			fputs(ti_sgr0, stdout);
+		if (ti_cnorm)
+			fputs(ti_cnorm, stdout);
+		if (!ti_sgr0 && !ti_cnorm)
+			printf("\033[0m\033[?25h");
 	}
 	fflush(stdout);
 	if (no_ansiterm)
@@ -176,7 +211,7 @@ static RETSIGTYPE win_change(ATTRIBUTE_UNUSED int sig)
 static void process_kbd(int s, struct packet *pkt)
 {
 	/* Suspend? */
-	if (!no_suspend && (pkt->u.buf[0] == cur_term.c_cc[VSUSP])) {
+	if (!no_suspend && (pkt->u.buf[0] == raw_term.c_cc[VSUSP])) {
 		/* Tell the master that we are suspending. */
 		pkt->type = MSG_DETACH;
 		write_packet_or_fail(s, pkt);
@@ -185,7 +220,7 @@ static void process_kbd(int s, struct packet *pkt)
 		tcsetattr(0, TCSADRAIN, &orig_term);
 		printf("%s", clear_csi_data());
 		kill(getpid(), SIGTSTP);
-		tcsetattr(0, TCSADRAIN, &cur_term);
+		tcsetattr(0, TCSADRAIN, &raw_term);
 
 		/* Tell the master that we are returning. */
 		pkt->type = MSG_ATTACH;
@@ -230,6 +265,9 @@ int replay_session_log(int saved_errno)
 	char log_path[600];
 	int logfd;
 	const char *name;
+
+	if (!no_ansiterm)
+		tstate_replay_preamble(sockname);
 
 	snprintf(log_path, sizeof(log_path), "%s.log", sockname);
 	logfd = open(log_path, O_RDONLY);
@@ -339,7 +377,7 @@ int attach_main(int noerror)
 
 	/* The current terminal settings are equal to the original terminal
 	 ** settings at this point. */
-	cur_term = orig_term;
+	raw_term = orig_term;
 
 	/* Set a trap to restore the terminal when we die. */
 	atexit(restore_term);
@@ -354,17 +392,17 @@ int attach_main(int noerror)
 	signal(SIGWINCH, win_change);
 
 	/* Set raw mode. */
-	cur_term.c_iflag &=
+	raw_term.c_iflag &=
 	    ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
-	cur_term.c_iflag &= ~(IXON | IXOFF);
-	cur_term.c_oflag &= ~(OPOST);
-	cur_term.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-	cur_term.c_cflag &= ~(CSIZE | PARENB);
-	cur_term.c_cflag |= CS8;
-	cur_term.c_cc[VLNEXT] = VDISABLE;
-	cur_term.c_cc[VMIN] = 1;
-	cur_term.c_cc[VTIME] = 0;
-	tcsetattr(0, TCSADRAIN, &cur_term);
+	raw_term.c_iflag &= ~(IXON | IXOFF);
+	raw_term.c_oflag &= ~(OPOST);
+	raw_term.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+	raw_term.c_cflag &= ~(CSIZE | PARENB);
+	raw_term.c_cflag |= CS8;
+	raw_term.c_cc[VLNEXT] = VDISABLE;
+	raw_term.c_cc[VMIN] = 1;
+	raw_term.c_cc[VTIME] = 0;
+	tcsetattr(0, TCSADRAIN, &raw_term);
 
 	/* Clear the screen on attach. Only do a full reset when explicitly
 	 ** requested (CLEAR_MOVE); default/unspec just emits a blank line so
@@ -373,9 +411,13 @@ int attach_main(int noerror)
 	 ** the separator: the log ends at the exact pty cursor position, so
 	 ** the prompt is already visible and correctly placed. */
 	if (clear_method == CLEAR_MOVE && !no_ansiterm) {
-		write_buf_or_fail(1, "\033c", 2);
-	} else if (!quiet && !skip_ring) {
-		write_buf_or_fail(1, "\r\n", 2);
+		if (ti_rs2)
+			write_buf_or_fail(1, ti_rs2, strlen(ti_rs2));
+		else
+			write_buf_or_fail(1, "\033c", 2);
+	} else {
+		if (!quiet && !skip_ring)
+			write_buf_or_fail(1, "\r\n", 2);
 	}
 
 	/* Tell the master that we want to attach.
@@ -462,6 +504,31 @@ int attach_main(int noerror)
 			write_packet_or_fail(s, &pkt);
 		}
 	}
+	return 0;
+}
+
+int push_bytes(const unsigned char *data, size_t datalen)
+{
+	struct packet pkt;
+	int s;
+
+	s = connect_socket(sockname);
+	if (s < 0)
+		return -1;
+	signal(SIGPIPE, SIG_IGN);
+	pkt.type = MSG_PUSH;
+	while (datalen > 0) {
+		size_t chunk = datalen > sizeof(pkt.u.buf) ? sizeof(pkt.u.buf) : datalen;
+		memcpy(pkt.u.buf, data, chunk);
+		pkt.len = chunk;
+		if (write(s, &pkt, sizeof(struct packet)) != sizeof(struct packet)) {
+			close(s);
+			return -1;
+		}
+		data += chunk;
+		datalen -= chunk;
+	}
+	close(s);
 	return 0;
 }
 

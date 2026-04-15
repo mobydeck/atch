@@ -60,6 +60,26 @@ static void rotate_log(void)
 
 	size = lseek(log_fd, 0, SEEK_END);
 	if (size > (off_t) log_max_size) {
+		off_t discard = size - (off_t) log_max_size;
+		unsigned char scan_buf[BUFSIZE];
+		off_t pos;
+
+		/* Scan the discarded prefix for terminal state sequences. */
+		lseek(log_fd, 0, SEEK_SET);
+		for (pos = 0; pos < discard; ) {
+			size_t chunk = sizeof(scan_buf);
+			if ((off_t) chunk > discard - pos)
+				chunk = (size_t)(discard - pos);
+			n = read(log_fd, scan_buf, chunk);
+			if (n <= 0)
+				break;
+			tstate_scan(scan_buf, (size_t)n);
+			pos += n;
+		}
+		if (tstate_is_dirty())
+			tstate_write_preamble(sockname);
+
+		/* Keep the tail. */
 		buf = malloc(log_max_size);
 		if (buf) {
 			lseek(log_fd, size - (off_t) log_max_size, SEEK_SET);
@@ -108,6 +128,7 @@ static void cleanup_session(void)
 		close(log_fd);
 		log_fd = -1;
 	}
+	tstate_cleanup(sockname);
 	unlink(sockname);
 }
 
@@ -730,6 +751,8 @@ int master_main(char **argv, int waitattach, int dontfork)
 		snprintf(log_path, sizeof(log_path), "%s.log", sockname);
 		log_fd = open_log(log_path);
 	}
+	tstate_load_global_config();
+	tstate_load_config(sockname);
 	master_start_time = time(NULL);
 #if defined(F_SETFD) && defined(FD_CLOEXEC)
 	fcntl(s, F_SETFD, FD_CLOEXEC);

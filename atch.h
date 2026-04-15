@@ -140,10 +140,33 @@ int attach_main(int noerror);
 int master_main(char **argv, int waitattach, int dontfork);
 int push_main(void);
 int rm_main(int all);
+int push_bytes(const unsigned char *data, size_t datalen);
 int list_main(int show_all);
 int kill_main(int force);
 
 char const * clear_csi_data(void);
+void init_terminfo(void);
+
+/* Terminal state tracking (tstate.c) */
+void tstate_scan(const unsigned char *buf, size_t len);
+int tstate_is_dirty(void);
+void tstate_write_preamble(const char *base);
+void tstate_cleanup(const char *base);
+int tstate_replay_preamble(const char *base);
+void tstate_load_global_config(void);
+void tstate_load_config(const char *base);
+void tstate_save_config(const char *base);
+void tstate_save_global_config(void);
+void tstate_show(const char *base);
+int tstate_find_mode(const char *name_or_number);
+int tstate_resolve_state(int mode, const char *val);
+int tstate_set_mode(int mode, int state);
+int tstate_toggle_mode(int mode);
+int tstate_track_mode(int mode, const char *name);
+int tstate_notrack_mode(int mode);
+int tstate_reset_all(unsigned char *buf, size_t buflen);
+int tstate_mode_seq(int mode, int state, unsigned char *buf, size_t buflen);
+int tstate_get_mode(int mode);  /* returns state: -1=unseen, 0=l, 1=h */
 
 #ifdef sun
 #define BROKEN_MASTER
