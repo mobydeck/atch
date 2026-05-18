@@ -83,7 +83,11 @@ static int open_log(const char *path)
 {
 	int fd;
 
-	fd = open(path, O_RDWR | O_CREAT, 0600);
+	/* O_NOFOLLOW: refuse to open if the log path is a symlink. Combined
+	** with the session-dir uid/mode check, this stops an attacker who
+	** controls the session directory from redirecting the log into an
+	** arbitrary file via a pre-placed symlink. */
+	fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
 	if (fd < 0)
 		return -1;
 

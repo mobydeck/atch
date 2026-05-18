@@ -254,6 +254,53 @@ static int parse_options(int *argc, char ***argv)
 	return 0;
 }
 
+/* lstat the socket path and unlink only if it really is a unix socket owned
+** by the current user. Without this check, a race between connect() failing
+** with ECONNREFUSED and the unlink lets an attacker who controls the session
+** directory swap in a symlink and have us delete an arbitrary file. */
+static void safe_unlink_socket(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) < 0)
+		return;
+	if (!S_ISSOCK(st.st_mode))
+		return;
+	if (st.st_uid != getuid())
+		return;
+	unlink(path);
+}
+
+/* Verify dir is a real directory owned by us with mode 0700. Refuse if not:
+** an attacker who pre-creates /tmp/.atch-<uid>/ (or any session dir) with
+** weaker modes or as a symlink could trick us into writing sockets and logs
+** under their control. lstat ensures we don't follow a symlink. */
+static int ensure_safe_dir(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) < 0) {
+		printf("%s: %s: %s\n", progname, path, strerror(errno));
+		return 1;
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		printf("%s: %s: not a directory\n", progname, path);
+		return 1;
+	}
+	if (st.st_uid != getuid()) {
+		printf("%s: %s: refusing to use directory not owned by uid %d\n",
+		       progname, path, (int)getuid());
+		return 1;
+	}
+	if ((st.st_mode & 077) != 0) {
+		printf("%s: %s: refusing to use directory with mode %04o "
+		       "(must be 0700)\n",
+		       progname, path, (unsigned)(st.st_mode & 07777));
+		return 1;
+	}
+	return 0;
+}
+
 /* Expand a bare session name to its full socket path in-place. */
 static void expand_sockname(void)
 {
@@ -273,6 +320,8 @@ static void expand_sockname(void)
 		*slash = '/';
 	}
 	mkdir(dir, 0700);
+	if (ensure_safe_dir(dir))
+		exit(1);
 	fulllen = strlen(dir) + 1 + strlen(sockname);
 	full = malloc(fulllen + 1);
 	snprintf(full, fulllen + 1, "%s/%s", dir, sockname);
@@ -520,6 +569,7 @@ static int cmd_clear(int argc, char **argv)
 	} else {
 		const char *chain = getenv(SESSION_ENVVAR);
 		const char *last;
+		char *copy;
 
 		if (!chain || !*chain) {
 			printf("%s: No session was specified.\n", progname);
@@ -528,7 +578,13 @@ static int cmd_clear(int argc, char **argv)
 			return 1;
 		}
 		last = strrchr(chain, ':');
-		sockname = (char *)(last ? last + 1 : chain);
+		/* getenv() returns a pointer into the environment block; sockname
+		** is char* and other code paths assume it's owned writable storage.
+		** Duplicate so we never cast away const or risk mutating env. */
+		copy = strdup(last ? last + 1 : chain);
+		if (!copy)
+			return 1;
+		sockname = copy;
 	}
 	if (argc > 0) {
 		printf("%s: Invalid number of arguments.\n", progname);
@@ -536,7 +592,10 @@ static int cmd_clear(int argc, char **argv)
 		return 1;
 	}
 	snprintf(log_path, sizeof(log_path), "%s.log", sockname);
-	fd = open(log_path, O_WRONLY | O_TRUNC);
+	/* O_NOFOLLOW: refuse to truncate via a symlink. Without it, anyone
+	** who can plant a symlink at <sockname>.log can redirect this truncate
+	** onto an arbitrary user-writable file. */
+	fd = open(log_path, O_WRONLY | O_TRUNC | O_NOFOLLOW);
 	if (fd >= 0) {
 		close(fd);
 		if (!quiet)
@@ -706,7 +765,7 @@ static int cmd_open(char *session, int argc, char **argv)
 
 			replay_session_log(saved_errno);
 			if (saved_errno == ECONNREFUSED)
-				unlink(sockname);
+				safe_unlink_socket(sockname);
 			if (master_main(argv, 1, 0) != 0)
 				return 1;
 			if (!quiet)
@@ -901,7 +960,7 @@ int main(int argc, char **argv)
 
 				replay_session_log(saved_errno);
 				if (saved_errno == ECONNREFUSED)
-					unlink(sockname);
+					safe_unlink_socket(sockname);
 				if (master_main(argv, 1, 0) != 0)
 					return 1;
 			}
