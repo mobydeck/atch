@@ -569,6 +569,7 @@ static int cmd_clear(int argc, char **argv)
 	} else {
 		const char *chain = getenv(SESSION_ENVVAR);
 		const char *last;
+		char *copy;
 
 		if (!chain || !*chain) {
 			printf("%s: No session was specified.\n", progname);
@@ -577,7 +578,13 @@ static int cmd_clear(int argc, char **argv)
 			return 1;
 		}
 		last = strrchr(chain, ':');
-		sockname = (char *)(last ? last + 1 : chain);
+		/* getenv() returns a pointer into the environment block; sockname
+		** is char* and other code paths assume it's owned writable storage.
+		** Duplicate so we never cast away const or risk mutating env. */
+		copy = strdup(last ? last + 1 : chain);
+		if (!copy)
+			return 1;
+		sockname = copy;
 	}
 	if (argc > 0) {
 		printf("%s: Invalid number of arguments.\n", progname);
@@ -585,7 +592,10 @@ static int cmd_clear(int argc, char **argv)
 		return 1;
 	}
 	snprintf(log_path, sizeof(log_path), "%s.log", sockname);
-	fd = open(log_path, O_WRONLY | O_TRUNC);
+	/* O_NOFOLLOW: refuse to truncate via a symlink. Without it, anyone
+	** who can plant a symlink at <sockname>.log can redirect this truncate
+	** onto an arbitrary user-writable file. */
+	fd = open(log_path, O_WRONLY | O_TRUNC | O_NOFOLLOW);
 	if (fd >= 0) {
 		close(fd);
 		if (!quiet)
