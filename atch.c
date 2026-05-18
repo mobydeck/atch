@@ -254,6 +254,23 @@ static int parse_options(int *argc, char ***argv)
 	return 0;
 }
 
+/* lstat the socket path and unlink only if it really is a unix socket owned
+** by the current user. Without this check, a race between connect() failing
+** with ECONNREFUSED and the unlink lets an attacker who controls the session
+** directory swap in a symlink and have us delete an arbitrary file. */
+static void safe_unlink_socket(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) < 0)
+		return;
+	if (!S_ISSOCK(st.st_mode))
+		return;
+	if (st.st_uid != getuid())
+		return;
+	unlink(path);
+}
+
 /* Verify dir is a real directory owned by us with mode 0700. Refuse if not:
 ** an attacker who pre-creates /tmp/.atch-<uid>/ (or any session dir) with
 ** weaker modes or as a symlink could trick us into writing sockets and logs
@@ -738,7 +755,7 @@ static int cmd_open(char *session, int argc, char **argv)
 
 			replay_session_log(saved_errno);
 			if (saved_errno == ECONNREFUSED)
-				unlink(sockname);
+				safe_unlink_socket(sockname);
 			if (master_main(argv, 1, 0) != 0)
 				return 1;
 			if (!quiet)
@@ -933,7 +950,7 @@ int main(int argc, char **argv)
 
 				replay_session_log(saved_errno);
 				if (saved_errno == ECONNREFUSED)
-					unlink(sockname);
+					safe_unlink_socket(sockname);
 				if (master_main(argv, 1, 0) != 0)
 					return 1;
 			}
