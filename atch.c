@@ -254,6 +254,36 @@ static int parse_options(int *argc, char ***argv)
 	return 0;
 }
 
+/* Verify dir is a real directory owned by us with mode 0700. Refuse if not:
+** an attacker who pre-creates /tmp/.atch-<uid>/ (or any session dir) with
+** weaker modes or as a symlink could trick us into writing sockets and logs
+** under their control. lstat ensures we don't follow a symlink. */
+static int ensure_safe_dir(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) < 0) {
+		printf("%s: %s: %s\n", progname, path, strerror(errno));
+		return 1;
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		printf("%s: %s: not a directory\n", progname, path);
+		return 1;
+	}
+	if (st.st_uid != getuid()) {
+		printf("%s: %s: refusing to use directory not owned by uid %d\n",
+		       progname, path, (int)getuid());
+		return 1;
+	}
+	if ((st.st_mode & 077) != 0) {
+		printf("%s: %s: refusing to use directory with mode %04o "
+		       "(must be 0700)\n",
+		       progname, path, (unsigned)(st.st_mode & 07777));
+		return 1;
+	}
+	return 0;
+}
+
 /* Expand a bare session name to its full socket path in-place. */
 static void expand_sockname(void)
 {
@@ -273,6 +303,8 @@ static void expand_sockname(void)
 		*slash = '/';
 	}
 	mkdir(dir, 0700);
+	if (ensure_safe_dir(dir))
+		exit(1);
 	fulllen = strlen(dir) + 1 + strlen(sockname);
 	full = malloc(fulllen + 1);
 	snprintf(full, fulllen + 1, "%s/%s", dir, sockname);
