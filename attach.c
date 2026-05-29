@@ -366,6 +366,49 @@ int attach_main(int noerror)
 	cur_term.c_cc[VTIME] = 0;
 	tcsetattr(0, TCSADRAIN, &cur_term);
 
+	/* Drain: now that we are in raw mode, swallow any terminal
+	 * responses provoked by the on-disk log replay.  We do this
+	 * BEFORE sending MSG_ATTACH / MSG_REDRAW so that the running
+	 * program's own query/response cycle (e.g. fish prompts after
+	 * SIGWINCH) flows through normally and is never swallowed.
+	 * Default 100ms; override with ATCH_DRAIN_MS, 0 to disable. */
+	{
+		int drain_ms = 100;
+		const char *env_drain = getenv("ATCH_DRAIN_MS");
+		if (env_drain)
+			drain_ms = atoi(env_drain);
+		if (drain_ms > 0) {
+			struct timeval deadline, now;
+			fd_set drfds;
+			unsigned char junk[256];
+
+			gettimeofday(&deadline, NULL);
+			deadline.tv_usec += (long)(drain_ms % 1000) * 1000;
+			deadline.tv_sec += drain_ms / 1000;
+			if (deadline.tv_usec >= 1000000) {
+				deadline.tv_sec++;
+				deadline.tv_usec -= 1000000;
+			}
+			for (;;) {
+				struct timeval tv;
+				long usec_left;
+
+				gettimeofday(&now, NULL);
+				usec_left =
+				    (deadline.tv_sec - now.tv_sec) * 1000000 +
+				    (deadline.tv_usec - now.tv_usec);
+				if (usec_left <= 0)
+					break;
+				tv.tv_sec = usec_left / 1000000;
+				tv.tv_usec = usec_left % 1000000;
+				FD_ZERO(&drfds);
+				FD_SET(0, &drfds);
+				if (select(1, &drfds, NULL, NULL, &tv) > 0)
+					(void)read(0, junk, sizeof(junk));
+			}
+		}
+	}
+
 	/* Clear the screen on attach. Only do a full reset when explicitly
 	 ** requested (CLEAR_MOVE); default/unspec just emits a blank line so
 	 ** any preceding log replay remains visible.
