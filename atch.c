@@ -36,9 +36,16 @@ const char *session_shortname(void)
 /* Returns the directory where session sockets are stored. */
 void get_session_dir(char *buf, size_t size)
 {
+	const char *dir_env = getenv("ATCH_SESSION_DIR");
 	const char *home = getenv("HOME");
 	const char *base = strrchr(progname, '/');
 	struct passwd *pw;
+
+	/* Allow override via ATCH_SESSION_DIR environment variable. */
+	if (dir_env && *dir_env) {
+		snprintf(buf, size, "%s", dir_env);
+		return;
+	}
 
 	base = base ? base + 1 : progname;
 
