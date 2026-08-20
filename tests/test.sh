@@ -276,6 +276,37 @@ run "$ATCH" kill -f s-noexist-force
 assert_exit     "kill -f: nonexistent → exit 1"      1 "$rc"
 assert_contains "kill -f: nonexistent → message"     "does not exist" "$out"
 
+# kill/stop refuses to target the session in the caller's own ancestry chain
+# (ATCH_SESSION), same guard as attach's self-attach check.
+# NOTE: `VAR=val run ...` would leak VAR into the rest of this script, since
+# `run` is a shell function -- a temporary assignment before a function call
+# persists after it returns (POSIX behavior, unlike prefixing an external
+# command). Export/unset explicitly instead.
+"$ATCH" start s-selfkill sleep 999
+export ATCH_SESSION="$HOME/.cache/atch/s-selfkill"
+run "$ATCH" kill s-selfkill
+unset ATCH_SESSION
+assert_exit     "kill: self → exit 1"                1 "$rc"
+assert_contains "kill: self → message"               "from within itself" "$out"
+tidy s-selfkill
+
+"$ATCH" start s-selfkillf sleep 999
+export ATCH_SESSION="$HOME/.cache/atch/s-selfkillf"
+run "$ATCH" kill -f s-selfkillf
+unset ATCH_SESSION
+assert_exit     "kill -f: self → exit 1"             1 "$rc"
+assert_contains "kill -f: self → message"            "from within itself" "$out"
+tidy s-selfkillf
+
+# a mismatched ATCH_SESSION (different session, not an ancestor) must not
+# trip the guard -- only an exact ancestry-chain match refuses the kill
+"$ATCH" start s-notself sleep 999
+export ATCH_SESSION="$HOME/.cache/atch/some-other-session"
+run "$ATCH" kill s-notself
+unset ATCH_SESSION
+assert_exit     "kill: non-ancestor session unaffected → exit 0" 0 "$rc"
+assert_contains "kill: non-ancestor session unaffected → stopped" "stopped" "$out"
+
 # ── 6. clear command ─────────────────────────────────────────────────────────
 
 run "$ATCH" clear

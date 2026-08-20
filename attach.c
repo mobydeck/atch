@@ -256,6 +256,34 @@ int replay_session_log(int saved_errno)
 	return 1;
 }
 
+/* Returns 1 if sockname appears in the current process's atch session
+** ancestry chain (SESSION_ENVVAR, colon-separated, outermost first).
+** Shared by attach_main and kill_main to refuse both direct self-
+** attach/self-kill and indirect loops like A -> B -> A. */
+static int session_in_ancestry(const char *sockname)
+{
+	const char *chain = getenv(SESSION_ENVVAR);
+	size_t slen;
+	const char *p;
+
+	if (!chain || !*chain)
+		return 0;
+
+	slen = strlen(sockname);
+	p = chain;
+	while (*p) {
+		const char *colon = strchr(p, ':');
+		size_t tlen = colon ? (size_t)(colon - p) : strlen(p);
+
+		if (tlen == slen && strncmp(p, sockname, tlen) == 0)
+			return 1;
+		if (!colon)
+			break;
+		p = colon + 1;
+	}
+	return 0;
+}
+
 int attach_main(int noerror)
 {
 	struct packet pkt;
@@ -264,35 +292,13 @@ int attach_main(int noerror)
 	int s;
 
 	/* Refuse to attach to any session in our ancestry chain (catches both
-	 * direct self-attach and indirect loops like A -> B -> A).
-	 * SESSION_ENVVAR is the colon-separated chain, so scanning it covers
-	 * all ancestors. */
-	{
-		const char *tosearch = getenv(SESSION_ENVVAR);
-
-		if (tosearch && *tosearch) {
-			size_t slen = strlen(sockname);
-			const char *p = tosearch;
-
-			while (*p) {
-				const char *colon = strchr(p, ':');
-				size_t tlen =
-				    colon ? (size_t)(colon - p) : strlen(p);
-
-				if (tlen == slen
-				    && strncmp(p, sockname, tlen) == 0) {
-					if (!noerror)
-						printf
-						    ("%s: cannot attach to session '%s' from within itself\n",
-						     progname,
-						     session_shortname());
-					return 1;
-				}
-				if (!colon)
-					break;
-				p = colon + 1;
-			}
-		}
+	 * direct self-attach and indirect loops like A -> B -> A). */
+	if (session_in_ancestry(sockname)) {
+		if (!noerror)
+			printf
+			    ("%s: cannot attach to session '%s' from within itself\n",
+			     progname, session_shortname());
+		return 1;
 	}
 
 	/* Attempt to open the socket. Don't display an error if noerror is
@@ -536,6 +542,17 @@ int kill_main(int force)
 {
 	const char *name = session_shortname();
 	int i;
+
+	/* Refuse to kill/stop any session in our ancestry chain — same check
+	 * as attach_main, see session_in_ancestry(). Previously unchecked:
+	 * killing your own controlling session from within it just made the
+	 * signal race the caller's own exit, with no explanatory message. */
+	if (session_in_ancestry(sockname)) {
+		printf
+		    ("%s: cannot kill/stop session '%s' from within itself — run this from another session or terminal instead\n",
+		     progname, name);
+		return 1;
+	}
 
 	signal(SIGPIPE, SIG_IGN);
 
